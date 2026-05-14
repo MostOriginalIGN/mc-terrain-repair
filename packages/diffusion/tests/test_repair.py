@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 import numpy as np
+import pytest
 import torch
 
 from diffusion.infer_inputs import prepare_inference_inputs
 from diffusion.repair_data import TerrainRepairDataset
-from diffusion.repair_inference import run_repair_job
+from diffusion.repair_inference import run_repair_job, run_saved_case_jobs
+from diffusion.repair_inference import main as repair_inference_main
 from diffusion.repair_model import TerrainRepairUNet
 from diffusion.repair_training import (
     RepairTrainingState,
@@ -43,7 +46,7 @@ def _batch_from_sample(sample: dict[str, torch.Tensor]) -> dict[str, torch.Tenso
 def test_repair_dataset_features_and_unknown_material(tmp_path) -> None:
     export_dir = tmp_path / "export"
     export_dir.mkdir()
-    _write_fake_export(export_dir)
+    _write_fake_export(export_dir, width_chunks=9)
 
     dataset = TerrainRepairDataset(export_dir, tile_size=128, mask_mode="mixed", seed=5, cache_arrays=False)
     sample = dataset[0]
@@ -66,7 +69,7 @@ def test_repair_dataset_features_and_unknown_material(tmp_path) -> None:
 def test_repair_model_training_and_checkpoint_roundtrip(tmp_path) -> None:
     export_dir = tmp_path / "export"
     export_dir.mkdir()
-    _write_fake_export(export_dir)
+    _write_fake_export(export_dir, width_chunks=9)
 
     dataset = TerrainRepairDataset(export_dir, tile_size=128, mask_mode="rectangle", seed=9)
     batch = _batch_from_sample(dataset[0])
@@ -110,8 +113,13 @@ def test_repair_model_training_and_checkpoint_roundtrip(tmp_path) -> None:
     assert payload["meta"]["epoch"] == 2
     assert payload["meta"]["global_step"] == 12
 
+    bad_checkpoint = tmp_path / "bad_repair.pt"
+    bad_checkpoint.write_bytes(b"not a torch checkpoint")
+    with pytest.raises(RuntimeError, match="Could not load repair checkpoint"):
+        load_repair_checkpoint(bad_checkpoint, reloaded)
 
-def test_repair_inference_outputs_and_preserves_known_pixels(tmp_path) -> None:
+
+def test_repair_inference_outputs_and_preserves_known_pixels(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     export_dir = tmp_path / "export"
     export_dir.mkdir()
     _write_fake_export(export_dir)
@@ -153,8 +161,37 @@ def test_repair_inference_outputs_and_preserves_known_pixels(tmp_path) -> None:
     assert outputs["material_preview"].exists()
     assert outputs["support_preview"].exists()
     assert outputs["preview_panel"].exists()
+    assert outputs["combined_render"].exists()
 
     known_height = np.load(inputs_dir / "known_height.npy")
     mask = np.load(inputs_dir / "mask.npy")
     repaired_height = np.load(out_dir / "height.npy")
     assert np.allclose(repaired_height[mask == 0], known_height[mask == 0])
+
+    saved_case = inputs_dir / "saved_cases" / "case_a"
+    saved_case.mkdir(parents=True)
+    for name in ("known_height.npy", "known_material.npy", "known_support.npy", "mask.npy"):
+        (saved_case / name).write_bytes((inputs_dir / name).read_bytes())
+    saved_outputs = run_saved_case_jobs(
+        checkpoint=checkpoint,
+        saved_cases_dir=inputs_dir / "saved_cases",
+        out_dir=tmp_path / "saved_outputs",
+    )
+    assert len(saved_outputs) == 1
+    assert saved_outputs[0]["preview_panel"].exists()
+    assert saved_outputs[0]["combined_render"].exists()
+    assert (tmp_path / "saved_outputs" / "combined_all_cases.png").exists()
+
+    argv = [
+        "repair_inference",
+        "--checkpoint",
+        str(checkpoint),
+        "--skip-current",
+        "--saved-cases-dir",
+        str(inputs_dir / "saved_cases"),
+        "--saved-cases-out-dir",
+        str(tmp_path / "cli_saved_outputs"),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    repair_inference_main()
+    assert (tmp_path / "cli_saved_outputs" / "case_a" / "combined_render.png").exists()

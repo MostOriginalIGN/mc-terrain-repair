@@ -11,6 +11,8 @@ KNOWN_HEIGHT ?= $(INPUTS)/known_height.npy
 KNOWN_MATERIAL ?= $(INPUTS)/known_material.npy
 MASK ?= $(INPUTS)/mask.npy
 OUTPUTS ?= ./outputs
+REPAIR_CASES ?= ./repair_cases
+CASE ?=
 SAMPLE_COUNT ?= 5
 SEED ?= 7
 LIMIT ?=
@@ -31,7 +33,7 @@ MASK_LEFT ?= 48
 MASK_HEIGHT ?= 32
 MASK_WIDTH ?= 32
 
-.PHONY: help sync test export visualize train train-repair prepare-infer infer repair infer-gui
+.PHONY: help sync test export visualize train train-repair prepare-infer infer repair repair-current repair-case infer-gui
 
 help:
 	@printf "Targets:\n"
@@ -43,7 +45,9 @@ help:
 	@printf "  make train-repair [EPOCHS=...] [BATCH_SIZE=...] [RESUME=...] [SAVE_EVERY=N]\n"
 	@printf "  make prepare-infer [ORIGIN_CHUNK_X=...]        Build known_height/material/mask from exported chunks\n"
 	@printf "  make infer [CHECKPOINT=...] [INPUTS=...]       Run tiled diffusion inference\n"
-	@printf "  make repair [REPAIR_CHECKPOINT=...] [INPUTS=...] Run deterministic repair inference\n"
+	@printf "  make repair [REPAIR_CHECKPOINT=...] [REPAIR_CASES=...] Run shared deterministic repair cases\n"
+	@printf "  make repair-current [INPUTS=...]                Run deterministic repair on prepared scratch inputs\n"
+	@printf "  make repair-case CASE=name                     Run deterministic repair on REPAIR_CASES/name\n"
 	@printf "  make infer-gui [CHECKPOINT=...]                Pick a chunk region in a local GUI and run regeneration\n"
 
 sync:
@@ -71,7 +75,13 @@ infer:
 	uv run --package mc-terrain-diffusion python -m diffusion.inference --checkpoint "$(CHECKPOINT)" --known-height "$(KNOWN_HEIGHT)" --known-material "$(KNOWN_MATERIAL)" --mask "$(MASK)" --out-dir "$(OUTPUTS)" --tile-size $(INFER_TILE_SIZE) --overlap $(OVERLAP) $(if $(NUM_STEPS),--num-steps $(NUM_STEPS),)
 
 repair:
+	uv run --package mc-terrain-diffusion python -m diffusion.repair_inference --checkpoint "$(REPAIR_CHECKPOINT)" --skip-current --saved-cases-dir "$(REPAIR_CASES)" --saved-cases-out-dir "$(OUTPUTS)/saved_cases"
+
+repair-current:
 	uv run --package mc-terrain-diffusion python -m diffusion.repair_inference --checkpoint "$(REPAIR_CHECKPOINT)" --known-height "$(KNOWN_HEIGHT)" --known-material "$(KNOWN_MATERIAL)" --mask "$(MASK)" --out-dir "$(OUTPUTS)" --known-support "$(INPUTS)/known_support.npy"
 
+repair-case:
+	uv run --package mc-terrain-diffusion python -m diffusion.repair_inference --checkpoint "$(REPAIR_CHECKPOINT)" --known-height "$(REPAIR_CASES)/$(CASE)/known_height.npy" --known-material "$(REPAIR_CASES)/$(CASE)/known_material.npy" --mask "$(REPAIR_CASES)/$(CASE)/mask.npy" --out-dir "$(OUTPUTS)/saved_cases/$(CASE)" --known-support "$(REPAIR_CASES)/$(CASE)/known_support.npy"
+
 infer-gui:
-	uv run --package mc-terrain-diffusion python scripts/infer_gui.py --export-dir "$(OUT)" --checkpoint "$(CHECKPOINT)" --inputs-dir "$(INPUTS)" --out-dir "$(OUTPUTS)" --tile-size $(INFER_TILE_SIZE) --overlap $(OVERLAP) $(if $(NUM_STEPS),--num-steps $(NUM_STEPS),)
+	uv run --package mc-terrain-diffusion python scripts/infer_gui.py --export-dir "$(OUT)" --checkpoint "$(CHECKPOINT)" --inputs-dir "$(INPUTS)" --repair-cases-dir "$(REPAIR_CASES)" --out-dir "$(OUTPUTS)" --tile-size $(INFER_TILE_SIZE) --overlap $(OVERLAP) $(if $(NUM_STEPS),--num-steps $(NUM_STEPS),)

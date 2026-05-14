@@ -15,7 +15,7 @@ for src_path in (str(DIFFUSION_SRC), str(EXPORTER_SRC), str(DATASET_SRC)):
     if src_path not in sys.path:
         sys.path.insert(0, src_path)
 
-from diffusion.infer_inputs import prepare_inference_inputs
+from diffusion.infer_inputs import prepare_inference_inputs  # noqa: E402
 
 
 def main() -> None:

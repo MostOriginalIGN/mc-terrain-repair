@@ -1,0 +1,12 @@
+{
+  "origin_chunk_x": 52,
+  "origin_chunk_z": 40,
+  "tile_size": 128,
+  "mask_top": 32,
+  "mask_left": 32,
+  "mask_height": 80,
+  "mask_width": 64,
+  "height_min": -56.0,
+  "height_max": 233.0,
+  "export_dir": "/Users/winlin/Documents/mc-terrain-diffusion/data/chunks"
+}

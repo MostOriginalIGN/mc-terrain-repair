@@ -17,7 +17,7 @@ src_path = str(EXPORTER_SRC)
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from exporter.visualize import (
+from exporter.visualize import (  # noqa: E402
     render_colormap,
     render_cross_section,
     render_export_colormap,

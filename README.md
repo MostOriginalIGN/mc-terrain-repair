@@ -17,6 +17,8 @@ make visualize
 make train EPOCHS=10
 make prepare-infer
 make infer
+make train-repair
+make repair
 ```
 
 `make export` accepts either a Minecraft save root or a direct overworld directory.

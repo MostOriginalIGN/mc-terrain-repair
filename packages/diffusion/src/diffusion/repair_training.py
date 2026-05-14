@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import os
+import pickle
 from pathlib import Path
 
 import torch
@@ -154,7 +156,9 @@ def save_repair_checkpoint(
     }
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(checkpoint, path)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def load_repair_checkpoint(
@@ -163,7 +167,22 @@ def load_repair_checkpoint(
     optimizer: torch.optim.Optimizer | None = None,
     map_location: str | torch.device = "cpu",
 ) -> dict[str, object]:
-    checkpoint = torch.load(path, map_location=map_location)
+    path = Path(path)
+    try:
+        checkpoint = torch.load(path, map_location=map_location)
+    except (OSError, RuntimeError, EOFError, ValueError, pickle.UnpicklingError) as exc:
+        raise RuntimeError(
+            f"Could not load repair checkpoint at {path.expanduser().resolve()}. "
+            "The file is missing, incomplete, or not a valid PyTorch repair checkpoint. "
+            "If training is still running, wait for it to finish saving; otherwise rerun "
+            "`make train-repair` to create a fresh checkpoint."
+        ) from exc
+    if not isinstance(checkpoint, dict) or "model_state" not in checkpoint:
+        raise RuntimeError(
+            f"Could not load repair checkpoint at {path.expanduser().resolve()}. "
+            "This file does not look like a deterministic repair checkpoint. "
+            "Use `make train-repair` to create artifacts/repair.pt before running `make repair`."
+        )
     model.load_state_dict(checkpoint["model_state"])
     if optimizer is not None and checkpoint.get("optimizer_state") is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state"])
