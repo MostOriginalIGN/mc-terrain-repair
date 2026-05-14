@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=82"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mc-terrain-diffusion"
+version = "0.1.0"
+description = "Minecraft surface terrain export and diffusion for Vanilla-style infill."
+requires-python = ">=3.10,<3.15"
+dependencies = [
+    "torch",
+    "numpy",
+    "tqdm",
+    "mc-terrain-exporter",
+    "mc-terrain-dataset",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

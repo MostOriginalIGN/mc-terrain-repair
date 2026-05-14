@@ -1,0 +1,14 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
+for relative in [
+    ROOT / 'packages' / 'diffusion' / 'src',
+    ROOT / 'packages' / 'exporter' / 'src',
+    ROOT / 'packages' / 'dataset' / 'src',
+]:
+    path = str(relative)
+    if path not in sys.path:
+        sys.path.insert(0, path)
