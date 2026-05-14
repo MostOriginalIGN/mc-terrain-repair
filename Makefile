@@ -10,7 +10,7 @@ MASK ?= $(INPUTS)/mask.npy
 OUTPUTS ?= ./outputs
 SAMPLE_COUNT ?= 5
 SEED ?= 7
-LIMIT ?= 500
+LIMIT ?=
 EPOCHS ?= 1
 BATCH_SIZE ?= 2
 LEARNING_RATE ?= 1e-4
@@ -32,7 +32,7 @@ help:
 	@printf "Targets:\n"
 	@printf "  make sync                                      Install workspace dependencies\n"
 	@printf "  make test                                      Run exporter and diffusion tests\n"
-	@printf "  make export WORLD=... [OUT=...]                Export chunk data from a save root or overworld dir\n"
+	@printf "  make export WORLD=... [LIMIT=500] [OUT=...]    Export chunk data from a save root or overworld dir\n"
 	@printf "  make visualize [OUT=...]                       Render export validation images\n"
 	@printf "  make train [EPOCHS=...] [BATCH_SIZE=...]       Train the diffusion scaffold\n"
 	@printf "  make prepare-infer [ORIGIN_CHUNK_X=...]        Build known_height/material/mask from exported chunks\n"
@@ -45,7 +45,7 @@ test:
 	$(PYTEST) packages/exporter/tests packages/diffusion/tests
 
 export:
-	uv run --package mc-terrain-exporter python scripts/run_export.py --world "$(WORLD)" --out "$(OUT)" --limit $(LIMIT)
+	uv run --package mc-terrain-exporter python scripts/run_export.py --world "$(WORLD)" --out "$(OUT)" $(if $(LIMIT),--limit $(LIMIT),)
 
 visualize:
 	uv run --package mc-terrain-exporter python scripts/visualize_export.py --export-dir "$(OUT)" --out-dir "$(RENDERS)" --sample-count $(SAMPLE_COUNT) --seed $(SEED)
