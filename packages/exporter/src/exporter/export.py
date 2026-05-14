@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import functools
 import hashlib
 import json
 import multiprocessing as mp
@@ -11,30 +12,27 @@ from pathlib import Path
 import random
 import time
 
+import anvil
 import numpy as np
 from tqdm.auto import tqdm
 
 from dataset.schema import chunk_blocks_filename, manifest_path, surface_filename
 
-from .reader import ChunkData, ChunkRef, ReaderStats, iter_chunk_refs, read_chunk
+from .reader import ChunkData, ChunkRef, ChunkWorkItem, ReaderStats, iter_chunk_coordinates, read_chunk
 from .vocab import UNKNOWN_INDEX, vocab_config_path
 
 
-def _worker_read_chunk(chunk_ref_fields: tuple) -> ChunkData | None:
-    chunk_ref = ChunkRef(
-        region_path=chunk_ref_fields[0],
-        chunk_x=chunk_ref_fields[1],
-        chunk_z=chunk_ref_fields[2],
-        local_x=chunk_ref_fields[3],
-        local_z=chunk_ref_fields[4],
-        region=None,
-    )
+@functools.lru_cache(maxsize=8)
+def _worker_open_region(path_str: str):
+    return anvil.Region.from_file(path_str)
+
+
+def _worker_read_chunk(item: ChunkWorkItem) -> ChunkData | None:
+    path_str, chunk_x, chunk_z, local_x, local_z = item
+    region = _worker_open_region(path_str)
+    ref = ChunkRef(Path(path_str), chunk_x, chunk_z, local_x, local_z, region=region)
     stats = ReaderStats()
-    return read_chunk(chunk_ref, stats)
-
-
-def _chunk_ref_to_fields(ref: ChunkRef) -> tuple:
-    return (ref.region_path, ref.chunk_x, ref.chunk_z, ref.local_x, ref.local_z)
+    return read_chunk(ref, stats)
 
 
 def export_chunks(
@@ -55,17 +53,17 @@ def export_chunks(
 
     stats = ReaderStats()
     manifest_stats = ManifestStats()
-    total_candidates = _count_candidate_chunks(world_path)
+    coords: list[ChunkWorkItem] = list(iter_chunk_coordinates(world_path))
+    total_candidates = len(coords)
     progress = ExportProgress(total_candidates=total_candidates, limit=limit)
 
-    chunk_refs = list(iter_chunk_refs(world_path))
     if seed is not None:
-        random.Random(seed).shuffle(chunk_refs)
+        random.Random(seed).shuffle(coords)
 
     if n_workers == 1:
-        _export_single(chunk_refs, out_dir, stats, manifest_stats, progress, limit)
+        _export_single(coords, out_dir, stats, manifest_stats, progress, limit)
     else:
-        _export_parallel(chunk_refs, out_dir, stats, manifest_stats, progress, limit, n_workers)
+        _export_parallel(coords, out_dir, stats, manifest_stats, progress, limit, n_workers)
 
     progress.close(stats, manifest_stats)
     _write_manifest(
@@ -77,16 +75,25 @@ def export_chunks(
 
 
 def _export_single(
-    chunk_refs: list[ChunkRef],
+    coords: list[ChunkWorkItem],
     out_dir: Path,
     stats: ReaderStats,
     manifest_stats: ManifestStats,
     progress: ExportProgress,
     limit: int | None,
 ) -> None:
-    for chunk_ref in chunk_refs:
+    coords_sorted = sorted(coords, key=lambda c: c[0])
+    region = None
+    current_path: str | None = None
+
+    for path_str, chunk_x, chunk_z, local_x, local_z in coords_sorted:
         progress.observe_scan(stats, manifest_stats)
-        chunk_data = read_chunk(chunk_ref, stats)
+        if path_str != current_path:
+            region = anvil.Region.from_file(path_str)
+            current_path = path_str
+
+        ref = ChunkRef(Path(path_str), chunk_x, chunk_z, local_x, local_z, region=region)
+        chunk_data = read_chunk(ref, stats)
         if chunk_data is None:
             progress.refresh(stats, manifest_stats)
             continue
@@ -100,7 +107,7 @@ def _export_single(
 
 
 def _export_parallel(
-    chunk_refs: list[ChunkRef],
+    coords: list[ChunkWorkItem],
     out_dir: Path,
     stats: ReaderStats,
     manifest_stats: ManifestStats,
@@ -108,10 +115,8 @@ def _export_parallel(
     limit: int | None,
     n_workers: int,
 ) -> None:
-    work_items = [_chunk_ref_to_fields(ref) for ref in chunk_refs]
-
     with mp.Pool(processes=n_workers) as pool:
-        for chunk_data in pool.imap_unordered(_worker_read_chunk, work_items, chunksize=4):
+        for chunk_data in pool.imap_unordered(_worker_read_chunk, coords, chunksize=4):
             progress.observe_scan(stats, manifest_stats)
 
             if chunk_data is None:
@@ -191,11 +196,6 @@ class ExportProgress:
     def close(self, stats: ReaderStats, manifest_stats: ManifestStats) -> None:
         self.refresh(stats, manifest_stats)
         self._bar.close()
-
-
-def _count_candidate_chunks(world_path: str) -> int:
-    region_dir = Path(world_path) / "region"
-    return len(list(region_dir.glob("*.mca"))) * 32 * 32
 
 
 def _save_chunk(out_dir: Path, chunk_data: ChunkData) -> None:

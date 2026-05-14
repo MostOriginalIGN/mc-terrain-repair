@@ -45,6 +45,9 @@ class ChunkRef:
     region: Any | None = None
 
 
+ChunkWorkItem = tuple[str, int, int, int, int]
+
+
 @dataclass
 class ReaderStats:
     skipped_not_full: int = 0
@@ -59,7 +62,7 @@ class ChunkIterator:
         self.stats = ReaderStats()
 
     def __iter__(self) -> Iterator[ChunkData]:
-        for chunk_ref in iter_chunk_refs(self.world_path):
+        for chunk_ref in iter_chunk_refs_by_region(self.world_path):
             chunk_data = read_chunk(chunk_ref, self.stats)
             if chunk_data is not None:
                 yield chunk_data
@@ -70,22 +73,48 @@ def iter_chunks(world_path: str) -> ChunkIterator:
     return ChunkIterator(world_path)
 
 
-def iter_chunk_refs(world_path: str) -> Iterator[ChunkRef]:
-    """Yield chunk references across all region files in the world."""
+def iter_chunk_coordinates(world_path: str) -> Iterator[ChunkWorkItem]:
+    """Yield work tuples only. Does not open region files (safe to list before fork)."""
     region_dir = Path(world_path) / "region"
     for region_path in sorted(region_dir.glob("*.mca")):
-        region = anvil.Region.from_file(str(region_path))
         region_x, region_z = _parse_region_coords(region_path)
+        path_str = str(region_path)
         for local_x in range(32):
             for local_z in range(32):
-                yield ChunkRef(
-                    region_path=region_path,
-                    chunk_x=(region_x * 32) + local_x,
-                    chunk_z=(region_z * 32) + local_z,
-                    local_x=local_x,
-                    local_z=local_z,
-                    region=region,
+                yield (
+                    path_str,
+                    (region_x * 32) + local_x,
+                    (region_z * 32) + local_z,
+                    local_x,
+                    local_z,
                 )
+
+
+def iter_chunk_refs(world_path: str) -> Iterator[ChunkRef]:
+    """Yield chunk references with ``region=None`` (caller opens file per chunk unless batched)."""
+    for path_str, chunk_x, chunk_z, local_x, local_z in iter_chunk_coordinates(world_path):
+        yield ChunkRef(Path(path_str), chunk_x, chunk_z, local_x, local_z, region=None)
+
+
+def iter_chunk_refs_by_region(world_path: str) -> Iterator[ChunkRef]:
+    """Yield refs sharing one open region at a time (one ``.mca`` in memory per file)."""
+    region_dir = Path(world_path) / "region"
+    for region_path in sorted(region_dir.glob("*.mca")):
+        region_x, region_z = _parse_region_coords(region_path)
+        region = anvil.Region.from_file(str(region_path))
+        try:
+            for local_x in range(32):
+                for local_z in range(32):
+                    yield ChunkRef(
+                        region_path=region_path,
+                        chunk_x=(region_x * 32) + local_x,
+                        chunk_z=(region_z * 32) + local_z,
+                        local_x=local_x,
+                        local_z=local_z,
+                        region=region,
+                    )
+        finally:
+            del region
 
 
 def read_chunk(chunk_ref: ChunkRef, stats: ReaderStats | None = None) -> ChunkData | None:

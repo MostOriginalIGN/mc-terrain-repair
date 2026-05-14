@@ -147,17 +147,20 @@ def test_export_pipeline_reader_vocab_and_visualization(monkeypatch, tmp_path) -
     payload = json.loads(vocab_config_path().read_text(encoding="utf-8"))
     assert payload == canonical_vocab_payload()
 
-    refs = [
-        type("Ref", (), {"chunk_x": 1, "chunk_z": 2})(),
-        type("Ref", (), {"chunk_x": 3, "chunk_z": 4})(),
-        type("Ref", (), {"chunk_x": 9, "chunk_z": 9})(),
-    ]
     chunks_by_coords = {
         (1, 2): _chunk(1, 2),
         (3, 4): _chunk(3, 4, fill=UNKNOWN_INDEX),
     }
 
-    monkeypatch.setattr("exporter.export.iter_chunk_refs", lambda world_path: list(refs))
+    monkeypatch.setattr(
+        "exporter.export.iter_chunk_coordinates",
+        lambda world_path: [
+            ("/tmp/r.0.0.mca", 1, 2, 0, 0),
+            ("/tmp/r.0.0.mca", 3, 4, 0, 0),
+            ("/tmp/r.0.0.mca", 9, 9, 0, 0),
+        ],
+    )
+    monkeypatch.setattr("exporter.export.anvil", FakeAnvil)
 
     def fake_read_chunk(ref, export_stats):
         if (ref.chunk_x, ref.chunk_z) == (9, 9):
