@@ -118,6 +118,20 @@ def _heightmap_image(surface_y: np.ndarray, mask: np.ndarray | None = None) -> I
     return image
 
 
+def _material_map_image(material_map: np.ndarray, mask: np.ndarray | None = None) -> Image.Image:
+    if material_map.ndim != 2:
+        raise ValueError(f"Expected a 2D material map array, got shape {material_map.shape}")
+    image = np.zeros(material_map.shape + (3,), dtype=np.uint8)
+    for index, color in VOCAB_COLORS.items():
+        image[material_map == index] = color
+    rendered = Image.fromarray(image, mode="RGB")
+    if mask is not None:
+        if mask.shape != material_map.shape:
+            raise ValueError(f"Mask shape {mask.shape} must match material map shape {material_map.shape}")
+        rendered = _draw_mask_box(rendered, mask)
+    return rendered
+
+
 def _surface_color_image(blocks: np.ndarray) -> Image.Image:
     if blocks.shape != (16, 16, SURFACE_DEPTH_BELOW + SURFACE_HEIGHT_ABOVE):
         raise ValueError(f"Unexpected block slab shape: {blocks.shape}")
@@ -247,14 +261,31 @@ def _compose_overview(previews: list[Image.Image]) -> Image.Image:
     return canvas
 
 
-def render_heightmap(surface_y: np.ndarray, out_path: str | Path, mask: np.ndarray | None = None, upscale: int = 16) -> None:
-    """Render a terrain-colored surface heightmap from a 2D Y array."""
+def heightmap_image(surface_y: np.ndarray, mask: np.ndarray | None = None, upscale: int = 1) -> Image.Image:
+    """Return a terrain-colored surface heightmap image from a 2D Y array."""
     image = _heightmap_image(surface_y, mask=mask)
     if upscale > 1:
         image = image.resize(
             (image.width * upscale, image.height * upscale),
             resample=Image.Resampling.NEAREST,
         )
+    return image
+
+
+def material_map_image(material_map: np.ndarray, mask: np.ndarray | None = None, upscale: int = 1) -> Image.Image:
+    """Return a color material map image from a 2D vocab-index array."""
+    image = _material_map_image(material_map, mask=mask)
+    if upscale > 1:
+        image = image.resize(
+            (image.width * upscale, image.height * upscale),
+            resample=Image.Resampling.NEAREST,
+        )
+    return image
+
+
+def render_heightmap(surface_y: np.ndarray, out_path: str | Path, mask: np.ndarray | None = None, upscale: int = 16) -> None:
+    """Render a terrain-colored surface heightmap from a 2D Y array."""
+    image = heightmap_image(surface_y, mask=mask, upscale=upscale)
     out_file = Path(out_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
     image.save(out_file)
@@ -263,6 +294,14 @@ def render_heightmap(surface_y: np.ndarray, out_path: str | Path, mask: np.ndarr
 def render_colormap(blocks: np.ndarray, out_path: str) -> None:
     """Render a color surface map from a `(16, 16, 40)` block slab."""
     image = _surface_color_image(blocks).resize((256, 256), resample=Image.Resampling.NEAREST)
+    out_file = Path(out_path)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    image.save(out_file)
+
+
+def render_material_map(material_map: np.ndarray, out_path: str | Path, mask: np.ndarray | None = None, upscale: int = 16) -> None:
+    """Render a color material map from a 2D vocab-index array."""
+    image = material_map_image(material_map, mask=mask, upscale=upscale)
     out_file = Path(out_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
     image.save(out_file)

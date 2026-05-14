@@ -6,10 +6,11 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+from PIL import Image, ImageDraw
 import torch
 from tqdm.auto import tqdm
 
-from exporter.visualize import render_heightmap
+from exporter.visualize import heightmap_image, material_map_image, render_heightmap, render_material_map
 from exporter.vocab import NUM_CLASSES
 
 from .model import TerrainDiffusionUNet
@@ -52,11 +53,11 @@ def _compute_gradients(known_height: torch.Tensor) -> torch.Tensor:
     return torch.stack([grad_x, grad_y], dim=1)
 
 
-def _load_array(path_str: str, name: str) -> np.ndarray:
+def _load_array(path_str: str | Path, name: str) -> np.ndarray:
     path = Path(path_str).expanduser().resolve()
     if not path.is_file():
         raise SystemExit(
-            f"Missing {name} file: {path}. Use scripts/prepare_infer_inputs.py or `make prepare-infer` first."
+            f'Missing {name} file: {path}. Use scripts/prepare_infer_inputs.py or `make prepare-infer` first.'
         )
     return np.load(path)
 
@@ -72,6 +73,36 @@ def _maybe_denormalize(height: np.ndarray, checkpoint_payload: dict[str, object]
     return height * (float(height_max) - float(height_min)) + float(height_min)
 
 
+
+
+def _compose_preview_panel(
+    known_height: np.ndarray,
+    known_material: np.ndarray,
+    result_height: np.ndarray,
+    result_material: np.ndarray,
+    mask: np.ndarray,
+) -> Image.Image:
+    panels = [
+        ('Known Height', heightmap_image(known_height, mask=mask, upscale=4)),
+        ('Known Material', material_map_image(known_material, mask=mask, upscale=4)),
+        ('Generated Height', heightmap_image(result_height, mask=mask, upscale=4)),
+        ('Generated Material', material_map_image(result_material, mask=mask, upscale=4)),
+    ]
+    tile_w = max(image.width for _, image in panels)
+    tile_h = max(image.height for _, image in panels)
+    header_h = 24
+    gutter = 12
+    canvas = Image.new('RGB', (gutter * 3 + tile_w * 2, gutter * 3 + (tile_h + header_h) * 2), color=(242, 240, 235))
+    draw = ImageDraw.Draw(canvas)
+    for index, (label, image) in enumerate(panels):
+        row = index // 2
+        col = index % 2
+        x = gutter + col * (tile_w + gutter)
+        y = gutter + row * (tile_h + header_h + gutter)
+        draw.text((x, y), label, fill=(30, 30, 30))
+        canvas.paste(image.convert('RGB'), (x, y + header_h))
+    return canvas
+
 def multidiffusion_inpaint(
     model: TerrainDiffusionUNet,
     scheduler: GaussianDiffusionScheduler,
@@ -85,7 +116,7 @@ def multidiffusion_inpaint(
     generator: torch.Generator | None = None,
 ) -> dict[str, torch.Tensor]:
     if known_height.ndim != 4 or known_height.shape[1] != 1:
-        raise ValueError(f"known_height must have shape [B, 1, H, W], got {tuple(known_height.shape)}")
+        raise ValueError(f'known_height must have shape [B, 1, H, W], got {tuple(known_height.shape)}')
     if mask.shape != known_height.shape:
         raise ValueError('mask must match known_height shape')
     if known_material.ndim != 3:
@@ -147,6 +178,73 @@ def multidiffusion_inpaint(
     }
 
 
+def run_inference_job(
+    checkpoint: str | Path,
+    known_height_path: str | Path,
+    known_material_path: str | Path,
+    mask_path: str | Path,
+    out_dir: str | Path,
+    tile_size: int = 128,
+    overlap: int = 32,
+    num_steps: int | None = None,
+) -> dict[str, Path]:
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = TerrainDiffusionUNet(num_material_classes=NUM_CLASSES).to(device)
+    checkpoint_payload = load_checkpoint(checkpoint, model, map_location=device)
+    scheduler = GaussianDiffusionScheduler().to(device)
+
+    known_height_array = _load_array(known_height_path, 'known height')
+    known_material_array = _load_array(known_material_path, 'known material')
+    mask_array = _load_array(mask_path, 'mask')
+
+    known_height = torch.from_numpy(known_height_array).float().unsqueeze(0).unsqueeze(0).to(device)
+    known_material = torch.from_numpy(known_material_array).long().unsqueeze(0).to(device)
+    mask = torch.from_numpy(mask_array).float().unsqueeze(0).unsqueeze(0).to(device)
+
+    result = multidiffusion_inpaint(
+        model=model,
+        scheduler=scheduler,
+        known_height=known_height,
+        known_material=known_material,
+        mask=mask,
+        tile_size=tile_size,
+        overlap=overlap,
+        num_steps=num_steps,
+    )
+
+    output_dir = Path(out_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    normalized_height = result['height'].squeeze(0).squeeze(0).cpu().numpy()
+    material = result['material'].squeeze(0).cpu().numpy()
+    np.save(output_dir / 'height.npy', normalized_height)
+    np.save(output_dir / 'material.npy', material)
+
+    world_height = _maybe_denormalize(normalized_height, checkpoint_payload)
+    preview_height = world_height if world_height is not None else normalized_height
+    if world_height is not None:
+        np.save(output_dir / 'height_world.npy', world_height)
+    render_heightmap(preview_height, output_dir / 'height_preview.png', mask=mask_array, upscale=4)
+    render_material_map(material, output_dir / 'material_preview.png', mask=mask_array, upscale=4)
+    preview_panel = _compose_preview_panel(
+        known_height=known_height_array,
+        known_material=known_material_array,
+        result_height=preview_height,
+        result_material=material,
+        mask=mask_array,
+    )
+    preview_panel.save(output_dir / 'preview_panel.png')
+
+    return {
+        'out_dir': output_dir,
+        'height': output_dir / 'height.npy',
+        'material': output_dir / 'material.npy',
+        'preview': output_dir / 'height_preview.png',
+        'material_preview': output_dir / 'material_preview.png',
+        'preview_panel': output_dir / 'preview_panel.png',
+        **({'height_world': output_dir / 'height_world.npy'} if world_height is not None else {}),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='Run tiled terrain diffusion inference.')
     parser.add_argument('--checkpoint', required=True)
@@ -159,41 +257,17 @@ def main() -> None:
     parser.add_argument('--num-steps', type=int, default=None)
     args = parser.parse_args()
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = TerrainDiffusionUNet(num_material_classes=NUM_CLASSES).to(device)
-    checkpoint_payload = load_checkpoint(args.checkpoint, model, map_location=device)
-    scheduler = GaussianDiffusionScheduler().to(device)
-
-    known_height_array = _load_array(args.known_height, 'known height')
-    known_material_array = _load_array(args.known_material, 'known material')
-    mask_array = _load_array(args.mask, 'mask')
-
-    known_height = torch.from_numpy(known_height_array).float().unsqueeze(0).unsqueeze(0).to(device)
-    known_material = torch.from_numpy(known_material_array).long().unsqueeze(0).to(device)
-    mask = torch.from_numpy(mask_array).float().unsqueeze(0).unsqueeze(0).to(device)
-
-    result = multidiffusion_inpaint(
-        model=model,
-        scheduler=scheduler,
-        known_height=known_height,
-        known_material=known_material,
-        mask=mask,
+    outputs = run_inference_job(
+        checkpoint=args.checkpoint,
+        known_height_path=args.known_height,
+        known_material_path=args.known_material,
+        mask_path=args.mask,
+        out_dir=args.out_dir,
         tile_size=args.tile_size,
         overlap=args.overlap,
         num_steps=args.num_steps,
     )
-
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    normalized_height = result['height'].squeeze(0).squeeze(0).cpu().numpy()
-    np.save(out_dir / 'height.npy', normalized_height)
-    np.save(out_dir / 'material.npy', result['material'].squeeze(0).cpu().numpy())
-    world_height = _maybe_denormalize(normalized_height, checkpoint_payload)
-    preview_height = world_height if world_height is not None else normalized_height
-    if world_height is not None:
-        np.save(out_dir / 'height_world.npy', world_height)
-    render_heightmap(preview_height, out_dir / 'height_preview.png', mask=mask_array, upscale=4)
-    print(f"Saved inference outputs to {out_dir.resolve()}")
+    print(f"Saved inference outputs to {outputs['out_dir']}")
 
 
 if __name__ == '__main__':

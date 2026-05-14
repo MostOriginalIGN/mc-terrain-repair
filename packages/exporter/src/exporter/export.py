@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import functools
 import hashlib
+import itertools
 import json
+import math
 import multiprocessing as mp
 from pathlib import Path
 import random
@@ -21,18 +24,94 @@ from dataset.schema import chunk_blocks_filename, manifest_path, surface_filenam
 from .reader import ChunkData, ChunkRef, ChunkWorkItem, ReaderStats, iter_chunk_coordinates, read_chunk
 from .vocab import UNKNOWN_INDEX, vocab_config_path
 
+REGION_CACHE_CAPACITY = 8
 
-@functools.lru_cache(maxsize=8)
+
+@dataclass(frozen=True)
+class WorkerResult:
+    chunk_data: ChunkData | None
+    skipped_not_full: int = 0
+    skipped_errors: int = 0
+
+
+@functools.lru_cache(maxsize=REGION_CACHE_CAPACITY)
 def _worker_open_region(path_str: str):
     return anvil.Region.from_file(path_str)
 
 
-def _worker_read_chunk(item: ChunkWorkItem) -> ChunkData | None:
+def _worker_read_chunk(item: ChunkWorkItem) -> WorkerResult:
     path_str, chunk_x, chunk_z, local_x, local_z = item
     region = _worker_open_region(path_str)
     ref = ChunkRef(Path(path_str), chunk_x, chunk_z, local_x, local_z, region=region)
     stats = ReaderStats()
-    return read_chunk(ref, stats)
+    chunk_data = read_chunk(ref, stats)
+    return WorkerResult(
+        chunk_data=chunk_data,
+        skipped_not_full=stats.skipped_not_full,
+        skipped_errors=stats.skipped_errors,
+    )
+
+
+def _bbox_center_chunk_coords(coords: list[ChunkWorkItem]) -> tuple[int, int]:
+    if not coords:
+        return 0, 0
+    xs = [item[1] for item in coords]
+    zs = [item[2] for item in coords]
+    return (min(xs) + max(xs)) // 2, (min(zs) + max(zs)) // 2
+
+
+def _chunk_center_sort_key(chunk_x: int, chunk_z: int, center_x: int, center_z: int) -> tuple[int, float, int, int]:
+    dx = chunk_x - center_x
+    dz = chunk_z - center_z
+    ring = max(abs(dx), abs(dz))
+    angle = math.atan2(dz, dx)
+    return (ring, angle, chunk_x, chunk_z)
+
+
+def _order_coords_for_export_inplace(
+    coords: list[ChunkWorkItem],
+    limit: int | None,
+    seed: int | None,
+) -> None:
+    """Keep region batches contiguous while still preferring center-near chunks for limited exports."""
+    if len(coords) <= 1:
+        return
+    if limit is None and seed is None:
+        return
+
+    center_x, center_z = _bbox_center_chunk_coords(coords)
+    grouped: OrderedDict[str, list[ChunkWorkItem]] = OrderedDict()
+    for item in coords:
+        grouped.setdefault(item[0], []).append(item)
+
+    def region_key(path_str: str, items: list[ChunkWorkItem]) -> tuple[int, float, int, int, str]:
+        xs = [item[1] for item in items]
+        zs = [item[2] for item in items]
+        region_center_x = (min(xs) + max(xs)) // 2
+        region_center_z = (min(zs) + max(zs)) // 2
+        ring, angle, _, _ = _chunk_center_sort_key(region_center_x, region_center_z, center_x, center_z)
+        return (ring, angle, region_center_x, region_center_z, path_str)
+
+    rng = random.Random(seed) if seed is not None else None
+    ordered: list[ChunkWorkItem] = []
+    for _, items in sorted(grouped.items(), key=lambda pair: region_key(pair[0], pair[1])):
+        items.sort(key=lambda item: _chunk_center_sort_key(item[1], item[2], center_x, center_z))
+        if rng is None:
+            ordered.extend(items)
+            continue
+        for _, group in itertools.groupby(
+            items,
+            key=lambda item: max(abs(item[1] - center_x), abs(item[2] - center_z)),
+        ):
+            ring_items = list(group)
+            rng.shuffle(ring_items)
+            ordered.extend(ring_items)
+    coords[:] = ordered
+
+
+def _merge_worker_stats(stats: ReaderStats, result: WorkerResult) -> None:
+    stats.skipped_not_full += result.skipped_not_full
+    stats.skipped_errors += result.skipped_errors
 
 
 def export_chunks(
@@ -42,10 +121,7 @@ def export_chunks(
     seed: int | None = None,
     workers: int = 1,
 ) -> None:
-    """Export chunks to ``.npy`` (16×16 surface heights + 16×16×40 blocks). Matches ``TerrainDiffusionDataset`` inputs.
-
-    ``workers``: process count; default ``1``. Use ``os.cpu_count()`` or the CLI default for parallelism.
-    """
+    """Export chunks to `.npy` (16x16 surface heights + 16x16x40 blocks)."""
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -57,8 +133,7 @@ def export_chunks(
     total_candidates = len(coords)
     progress = ExportProgress(total_candidates=total_candidates, limit=limit)
 
-    if seed is not None:
-        random.Random(seed).shuffle(coords)
+    _order_coords_for_export_inplace(coords, limit=limit, seed=seed)
 
     if n_workers == 1:
         _export_single(coords, out_dir, stats, manifest_stats, progress, limit)
@@ -82,16 +157,21 @@ def _export_single(
     progress: ExportProgress,
     limit: int | None,
 ) -> None:
-    coords_sorted = sorted(coords, key=lambda c: c[0])
-    region = None
-    current_path: str | None = None
+    open_regions: OrderedDict[str, anvil.Region] = OrderedDict()
 
-    for path_str, chunk_x, chunk_z, local_x, local_z in coords_sorted:
+    def region_for(path_str: str) -> anvil.Region:
+        if path_str in open_regions:
+            open_regions.move_to_end(path_str)
+            return open_regions[path_str]
+        region = anvil.Region.from_file(path_str)
+        open_regions[path_str] = region
+        while len(open_regions) > REGION_CACHE_CAPACITY:
+            open_regions.popitem(last=False)
+        return region
+
+    for path_str, chunk_x, chunk_z, local_x, local_z in coords:
         progress.observe_scan(stats, manifest_stats)
-        if path_str != current_path:
-            region = anvil.Region.from_file(path_str)
-            current_path = path_str
-
+        region = region_for(path_str)
         ref = ChunkRef(Path(path_str), chunk_x, chunk_z, local_x, local_z, region=region)
         chunk_data = read_chunk(ref, stats)
         if chunk_data is None:
@@ -116,9 +196,11 @@ def _export_parallel(
     n_workers: int,
 ) -> None:
     with mp.Pool(processes=n_workers) as pool:
-        for chunk_data in pool.imap_unordered(_worker_read_chunk, coords, chunksize=4):
+        for result in pool.imap(_worker_read_chunk, coords, chunksize=4):
+            _merge_worker_stats(stats, result)
             progress.observe_scan(stats, manifest_stats)
 
+            chunk_data = result.chunk_data
             if chunk_data is None:
                 progress.refresh(stats, manifest_stats)
                 continue
@@ -218,19 +300,19 @@ def _write_manifest(
     vocab_hash = hashlib.sha256(vocab_bytes).hexdigest()
 
     manifest = {
-        "chunk_count": manifest_stats.chunk_count,
-        "world_path": str(Path(world_path).resolve()),
-        "export_timestamp": datetime.now(timezone.utc).isoformat(),
-        "vocab_version_hash": vocab_hash,
-        "min_chunk_x": manifest_stats.min_chunk_x,
-        "max_chunk_x": manifest_stats.max_chunk_x,
-        "min_chunk_z": manifest_stats.min_chunk_z,
-        "max_chunk_z": manifest_stats.max_chunk_z,
-        "unknown_block_count": manifest_stats.unknown_block_count,
-        "total_block_count": manifest_stats.total_block_count,
-        "unknown_block_rate": unknown_block_rate,
-        "skipped_not_full": stats.skipped_not_full,
-        "skipped_errors": stats.skipped_errors,
+        'chunk_count': manifest_stats.chunk_count,
+        'world_path': str(Path(world_path).resolve()),
+        'export_timestamp': datetime.now(timezone.utc).isoformat(),
+        'vocab_version_hash': vocab_hash,
+        'min_chunk_x': manifest_stats.min_chunk_x,
+        'max_chunk_x': manifest_stats.max_chunk_x,
+        'min_chunk_z': manifest_stats.min_chunk_z,
+        'max_chunk_z': manifest_stats.max_chunk_z,
+        'unknown_block_count': manifest_stats.unknown_block_count,
+        'total_block_count': manifest_stats.total_block_count,
+        'unknown_block_rate': unknown_block_rate,
+        'skipped_not_full': stats.skipped_not_full,
+        'skipped_errors': stats.skipped_errors,
     }
 
-    manifest_path(out_dir).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    manifest_path(out_dir).write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')

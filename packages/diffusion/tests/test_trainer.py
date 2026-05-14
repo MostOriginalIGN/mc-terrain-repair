@@ -8,7 +8,15 @@ import torch
 from diffusion.data import TerrainDiffusionDataset
 from diffusion.model import TerrainDiffusionUNet
 from diffusion.scheduler import GaussianDiffusionScheduler
-from diffusion.training import compute_losses, load_checkpoint, save_checkpoint, train_step
+from diffusion.training import (
+    TrainingState,
+    build_checkpoint_meta,
+    compute_losses,
+    load_checkpoint,
+    restore_training_state,
+    save_checkpoint,
+    train_step,
+)
 
 
 def _write_fake_export(export_dir: Path, width_chunks: int = 8, height_chunks: int = 8) -> None:
@@ -40,8 +48,23 @@ def test_trainer_step_and_checkpoint_roundtrip(tmp_path) -> None:
     train_step(model, optimizer, scheduler, batch)
 
     checkpoint = tmp_path / 'diffusion.pt'
-    save_checkpoint(checkpoint, model, optimizer, scheduler, meta={'tile_size': 128})
+    args = type('Args', (), {
+        'tile_size': 128,
+        'stride_chunks': 1,
+        'export_dir': str(export_dir),
+    })()
+    meta = build_checkpoint_meta(args, dataset, TrainingState(completed_epochs=3, global_step=17), interrupted=False)
+    save_checkpoint(checkpoint, model, optimizer, scheduler, meta=meta)
+
     reloaded = TerrainDiffusionUNet(num_material_classes=dataset.num_material_classes)
-    payload = load_checkpoint(checkpoint, reloaded)
+    reloaded_optimizer = torch.optim.AdamW(reloaded.parameters(), lr=1e-4)
+    payload = load_checkpoint(checkpoint, reloaded, optimizer=reloaded_optimizer)
+    state = restore_training_state(payload)
 
     assert payload['meta']['tile_size'] == 128
+    assert payload['meta']['epoch'] == 3
+    assert payload['meta']['global_step'] == 17
+    assert payload['meta']['interrupted'] is False
+    assert state.completed_epochs == 3
+    assert state.global_step == 17
+    assert reloaded_optimizer.state_dict()['state']

@@ -23,6 +23,12 @@ class LossOutput:
     material_loss: torch.Tensor
 
 
+@dataclass(frozen=True)
+class TrainingState:
+    completed_epochs: int = 0
+    global_step: int = 0
+
+
 def compute_losses(
     model: TerrainDiffusionUNet,
     scheduler: GaussianDiffusionScheduler,
@@ -102,11 +108,59 @@ def load_checkpoint(
     return checkpoint
 
 
+def restore_training_state(payload: dict[str, object]) -> TrainingState:
+    meta = payload.get('meta')
+    if not isinstance(meta, dict):
+        return TrainingState()
+    completed_epochs = int(meta.get('epoch', 0) or 0)
+    global_step = int(meta.get('global_step', 0) or 0)
+    return TrainingState(completed_epochs=completed_epochs, global_step=global_step)
+
+
+def build_checkpoint_meta(
+    args: argparse.Namespace,
+    dataset: TerrainDiffusionDataset,
+    state: TrainingState,
+    interrupted: bool,
+) -> dict[str, object]:
+    return {
+        'tile_size': args.tile_size,
+        'stride_chunks': args.stride_chunks,
+        'height_min': dataset.height_min,
+        'height_max': dataset.height_max,
+        'export_dir': str(Path(args.export_dir).resolve()),
+        'epoch': state.completed_epochs,
+        'global_step': state.global_step,
+        'interrupted': interrupted,
+    }
+
+
+def persist_training_checkpoint(
+    checkpoint_path: str | Path,
+    model: TerrainDiffusionUNet,
+    optimizer: torch.optim.Optimizer,
+    scheduler: GaussianDiffusionScheduler,
+    args: argparse.Namespace,
+    dataset: TerrainDiffusionDataset,
+    state: TrainingState,
+    interrupted: bool,
+) -> None:
+    save_checkpoint(
+        checkpoint_path,
+        model,
+        optimizer,
+        scheduler,
+        meta=build_checkpoint_meta(args, dataset, state, interrupted=interrupted),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='Train the surface-oriented terrain diffusion scaffold.')
     parser.add_argument('--export-dir', required=True, help='Directory containing exported chunk and surface arrays')
     parser.add_argument('--checkpoint', required=True, help='Output checkpoint path')
-    parser.add_argument('--epochs', type=int, default=1)
+    parser.add_argument('--resume', default=None, help='Optional checkpoint to resume from')
+    parser.add_argument('--epochs', type=int, default=1, help='Total target epoch count, including resumed epochs')
+    parser.add_argument('--save-every', type=int, default=1, help='Save a checkpoint every N epochs')
     parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--learning-rate', type=float, default=1e-4)
     parser.add_argument('--tile-size', type=int, default=128)
@@ -124,44 +178,91 @@ def main() -> None:
     scheduler = GaussianDiffusionScheduler().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
 
-    model.train()
-    for epoch in range(args.epochs):
-        losses: LossOutput | None = None
-        progress = tqdm(
-            loader,
-            desc=f'Epoch {epoch + 1}/{args.epochs}',
-            unit='batch',
-            dynamic_ncols=True,
+    state = TrainingState()
+    if args.resume is not None:
+        payload = load_checkpoint(args.resume, model, optimizer=optimizer, map_location=device)
+        state = restore_training_state(payload)
+        print(
+            f"Resumed from {Path(args.resume).resolve()} at epoch {state.completed_epochs} "
+            f"step {state.global_step}"
         )
-        for batch in progress:
-            batch = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in batch.items()}
-            losses = train_step(model, optimizer, scheduler, batch)
-            progress.set_postfix({
-                'total': f'{losses.total_loss.item():.4f}',
-                'noise': f'{losses.noise_loss.item():.4f}',
-                'material': f'{losses.material_loss.item():.4f}',
-            })
-        progress.close()
-        if losses is not None:
-            print(
-                f"epoch {epoch + 1}/{args.epochs}: "
-                f"total={losses.total_loss.item():.4f} noise={losses.noise_loss.item():.4f} material={losses.material_loss.item():.4f}"
-            )
 
-    save_checkpoint(
-        args.checkpoint,
-        model,
-        optimizer,
-        scheduler,
-        meta={
-            'tile_size': args.tile_size,
-            'stride_chunks': args.stride_chunks,
-            'height_min': dataset.height_min,
-            'height_max': dataset.height_max,
-            'export_dir': str(Path(args.export_dir).resolve()),
-        },
-    )
-    print(f"Saved checkpoint to {Path(args.checkpoint).resolve()}")
+    if state.completed_epochs >= args.epochs:
+        print(
+            f'Checkpoint already reached epoch {state.completed_epochs}, which meets or exceeds --epochs {args.epochs}. '
+            'Nothing to do.'
+        )
+        return
+
+    model.train()
+    progress: tqdm | None = None
+    try:
+        for epoch in range(state.completed_epochs, args.epochs):
+            losses: LossOutput | None = None
+            progress = tqdm(
+                loader,
+                desc=f'Epoch {epoch + 1}/{args.epochs}',
+                unit='batch',
+                dynamic_ncols=True,
+            )
+            for batch in progress:
+                batch = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in batch.items()}
+                losses = train_step(model, optimizer, scheduler, batch)
+                state = TrainingState(completed_epochs=epoch, global_step=state.global_step + 1)
+                progress.set_postfix({
+                    'total': f'{losses.total_loss.item():.4f}',
+                    'noise': f'{losses.noise_loss.item():.4f}',
+                    'material': f'{losses.material_loss.item():.4f}',
+                    'step': state.global_step,
+                })
+            progress.close()
+            progress = None
+            state = TrainingState(completed_epochs=epoch + 1, global_step=state.global_step)
+            if losses is not None:
+                print(
+                    f"epoch {epoch + 1}/{args.epochs}: "
+                    f"total={losses.total_loss.item():.4f} noise={losses.noise_loss.item():.4f} material={losses.material_loss.item():.4f}"
+                )
+            if args.save_every > 0 and ((epoch + 1) % args.save_every == 0 or epoch + 1 == args.epochs):
+                persist_training_checkpoint(
+                    args.checkpoint,
+                    model,
+                    optimizer,
+                    scheduler,
+                    args,
+                    dataset,
+                    state,
+                    interrupted=False,
+                )
+                print(f'Saved checkpoint to {Path(args.checkpoint).resolve()}')
+    except KeyboardInterrupt:
+        if progress is not None:
+            progress.close()
+        persist_training_checkpoint(
+            args.checkpoint,
+            model,
+            optimizer,
+            scheduler,
+            args,
+            dataset,
+            state,
+            interrupted=True,
+        )
+        print(f'Interrupted. Saved checkpoint to {Path(args.checkpoint).resolve()}')
+        return
+
+    if args.save_every <= 0:
+        persist_training_checkpoint(
+            args.checkpoint,
+            model,
+            optimizer,
+            scheduler,
+            args,
+            dataset,
+            state,
+            interrupted=False,
+        )
+        print(f'Saved checkpoint to {Path(args.checkpoint).resolve()}')
 
 
 if __name__ == '__main__':
