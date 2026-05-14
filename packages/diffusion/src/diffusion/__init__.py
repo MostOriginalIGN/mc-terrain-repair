@@ -11,6 +11,9 @@ __all__ = [
     'TerrainDiffusionDataset',
     'TerrainDiffusionOutput',
     'TerrainDiffusionUNet',
+    'TerrainRepairDataset',
+    'TerrainRepairOutput',
+    'TerrainRepairUNet',
     'TerrainWindowSample',
     'compute_losses',
     'find_origin',
@@ -20,13 +23,16 @@ __all__ = [
     'plan_chunk_selection',
     'prepare_inference_inputs',
     'run_inference_job',
+    'run_repair_job',
     'save_checkpoint',
     'train_step',
+    'train_repair_step',
 ]
 
 _MODULE_EXPORTS = {
     'TerrainDiffusionDataset': ('.data', 'TerrainDiffusionDataset'),
     'TerrainWindowSample': ('.data', 'TerrainWindowSample'),
+    'TerrainRepairDataset': ('.repair_data', 'TerrainRepairDataset'),
     'SelectionPlan': ('.infer_inputs', 'SelectionPlan'),
     'find_origin': ('.infer_inputs', 'find_origin'),
     'load_height_range': ('.infer_inputs', 'load_height_range'),
@@ -36,11 +42,15 @@ _MODULE_EXPORTS = {
     'run_inference_job': ('.inference', 'run_inference_job'),
     'TerrainDiffusionOutput': ('.model', 'TerrainDiffusionOutput'),
     'TerrainDiffusionUNet': ('.model', 'TerrainDiffusionUNet'),
+    'TerrainRepairOutput': ('.repair_model', 'TerrainRepairOutput'),
+    'TerrainRepairUNet': ('.repair_model', 'TerrainRepairUNet'),
     'GaussianDiffusionScheduler': ('.scheduler', 'GaussianDiffusionScheduler'),
+    'run_repair_job': ('.repair_inference', 'run_repair_job'),
     'compute_losses': ('.training', 'compute_losses'),
     'load_checkpoint': ('.training', 'load_checkpoint'),
     'save_checkpoint': ('.training', 'save_checkpoint'),
     'train_step': ('.training', 'train_step'),
+    'train_repair_step': ('.repair_training', 'train_repair_step'),
 }
 
 
