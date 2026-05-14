@@ -6,16 +6,35 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import multiprocessing as mp
 from pathlib import Path
 import random
+import time
 
 import numpy as np
 from tqdm.auto import tqdm
 
 from dataset.schema import chunk_blocks_filename, manifest_path, surface_filename
 
-from .reader import ChunkData, ReaderStats, iter_chunk_refs, read_chunk
+from .reader import ChunkData, ChunkRef, ReaderStats, iter_chunk_refs, read_chunk
 from .vocab import UNKNOWN_INDEX, vocab_config_path
+
+
+def _worker_read_chunk(chunk_ref_fields: tuple) -> ChunkData | None:
+    chunk_ref = ChunkRef(
+        region_path=chunk_ref_fields[0],
+        chunk_x=chunk_ref_fields[1],
+        chunk_z=chunk_ref_fields[2],
+        local_x=chunk_ref_fields[3],
+        local_z=chunk_ref_fields[4],
+        region=None,
+    )
+    stats = ReaderStats()
+    return read_chunk(chunk_ref, stats)
+
+
+def _chunk_ref_to_fields(ref: ChunkRef) -> tuple:
+    return (ref.region_path, ref.chunk_x, ref.chunk_z, ref.local_x, ref.local_z)
 
 
 def export_chunks(
@@ -23,20 +42,48 @@ def export_chunks(
     output_dir: str,
     limit: int | None = None,
     seed: int | None = None,
+    workers: int = 1,
 ) -> None:
-    """Export terrain chunks from a Minecraft world to `.npy` arrays."""
+    """Export chunks to ``.npy`` (16×16 surface heights + 16×16×40 blocks). Matches ``TerrainDiffusionDataset`` inputs.
+
+    ``workers``: process count; default ``1``. Use ``os.cpu_count()`` or the CLI default for parallelism.
+    """
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    n_workers = max(1, workers)
 
     stats = ReaderStats()
     manifest_stats = ManifestStats()
     total_candidates = _count_candidate_chunks(world_path)
     progress = ExportProgress(total_candidates=total_candidates, limit=limit)
 
-    chunk_refs = list(iter_chunk_refs(world_path)) if seed is not None else iter_chunk_refs(world_path)
+    chunk_refs = list(iter_chunk_refs(world_path))
     if seed is not None:
         random.Random(seed).shuffle(chunk_refs)
 
+    if n_workers == 1:
+        _export_single(chunk_refs, out_dir, stats, manifest_stats, progress, limit)
+    else:
+        _export_parallel(chunk_refs, out_dir, stats, manifest_stats, progress, limit, n_workers)
+
+    progress.close(stats, manifest_stats)
+    _write_manifest(
+        out_dir=out_dir,
+        world_path=world_path,
+        manifest_stats=manifest_stats,
+        stats=stats,
+    )
+
+
+def _export_single(
+    chunk_refs: list[ChunkRef],
+    out_dir: Path,
+    stats: ReaderStats,
+    manifest_stats: ManifestStats,
+    progress: ExportProgress,
+    limit: int | None,
+) -> None:
     for chunk_ref in chunk_refs:
         progress.observe_scan(stats, manifest_stats)
         chunk_data = read_chunk(chunk_ref, stats)
@@ -51,13 +98,33 @@ def export_chunks(
         if limit is not None and manifest_stats.chunk_count >= limit:
             break
 
-    progress.close(stats, manifest_stats)
-    _write_manifest(
-        out_dir=out_dir,
-        world_path=world_path,
-        manifest_stats=manifest_stats,
-        stats=stats,
-    )
+
+def _export_parallel(
+    chunk_refs: list[ChunkRef],
+    out_dir: Path,
+    stats: ReaderStats,
+    manifest_stats: ManifestStats,
+    progress: ExportProgress,
+    limit: int | None,
+    n_workers: int,
+) -> None:
+    work_items = [_chunk_ref_to_fields(ref) for ref in chunk_refs]
+
+    with mp.Pool(processes=n_workers) as pool:
+        for chunk_data in pool.imap_unordered(_worker_read_chunk, work_items, chunksize=4):
+            progress.observe_scan(stats, manifest_stats)
+
+            if chunk_data is None:
+                progress.refresh(stats, manifest_stats)
+                continue
+
+            _save_chunk(out_dir, chunk_data)
+            manifest_stats.observe(chunk_data)
+            progress.observe_export(stats, manifest_stats)
+
+            if limit is not None and manifest_stats.chunk_count >= limit:
+                pool.terminate()
+                break
 
 
 @dataclass
@@ -85,10 +152,12 @@ class ExportProgress:
         self.total_candidates = total_candidates
         self.limit = limit
         self.scanned = 0
-        self._last_postfix = (-1, -1, -1)
-        total = limit if limit is not None else total_candidates
+        self.start_time = time.perf_counter()
+        self._last_postfix = (-1, -1, -1, -1)
         self._export_only = limit is not None
-        self._bar = tqdm(total=total, unit='chunk', desc='Exporting', dynamic_ncols=True)
+        total = limit if self._export_only else total_candidates
+        unit = 'chunk' if self._export_only else 'candidate'
+        self._bar = tqdm(total=total, unit=unit, desc='Exporting', dynamic_ncols=True)
 
     def observe_scan(self, stats: ReaderStats, manifest_stats: ManifestStats) -> None:
         self.scanned += 1
@@ -102,23 +171,22 @@ class ExportProgress:
         self.refresh(stats, manifest_stats)
 
     def refresh(self, stats: ReaderStats, manifest_stats: ManifestStats) -> None:
-        postfix = (manifest_stats.chunk_count, stats.skipped_not_full, stats.skipped_errors)
+        elapsed = max(time.perf_counter() - self.start_time, 1e-9)
+        exported = manifest_stats.chunk_count
+        export_rate = exported / elapsed
+        postfix = (exported, stats.skipped_not_full, stats.skipped_errors, self.scanned)
         if postfix == self._last_postfix:
             return
         self._last_postfix = postfix
+        payload = {
+            'exported': exported,
+            'export_chunk/s': f'{export_rate:.2f}',
+            'skipped_nf': stats.skipped_not_full,
+            'errors': stats.skipped_errors,
+        }
         if self._export_only:
-            self._bar.set_postfix({
-                'exported': manifest_stats.chunk_count,
-                'skipped_nf': stats.skipped_not_full,
-                'errors': stats.skipped_errors,
-                'scanned': self.scanned,
-            })
-        else:
-            self._bar.set_postfix({
-                'exported': manifest_stats.chunk_count,
-                'skipped_nf': stats.skipped_not_full,
-                'errors': stats.skipped_errors,
-            })
+            payload['scanned'] = self.scanned
+        self._bar.set_postfix(payload)
 
     def close(self, stats: ReaderStats, manifest_stats: ManifestStats) -> None:
         self.refresh(stats, manifest_stats)

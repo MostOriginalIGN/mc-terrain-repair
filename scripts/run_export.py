@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 from pathlib import Path
 import sys
 
@@ -48,10 +49,18 @@ def main() -> None:
     parser.add_argument("--out", required=True, help="Output directory for exported `.npy` files")
     parser.add_argument("--limit", type=int, default=None, help="Maximum number of chunks to export")
     parser.add_argument("--seed", type=int, default=None, help="Seed for deterministic chunk shuffling")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Parallel worker processes (default: all CPUs; use 1 for single-process)",
+    )
     args = parser.parse_args()
 
     world_path = resolve_world_path(args.world)
-    export_chunks(str(world_path), args.out, limit=args.limit, seed=args.seed)
+    n_workers = args.workers if args.workers is not None else mp.cpu_count()
+    export_chunks(str(world_path), args.out, limit=args.limit, seed=args.seed, workers=n_workers)
     print(f"Export completed for world {world_path} into {Path(args.out).resolve()}")
 
 

@@ -28,6 +28,7 @@ class FakeChunk:
         self.x = 10
         self.z = -4
         self.data = {"Status": "minecraft:full"}
+        self.loaded_sections: list[int] = []
 
     def get_block(self, x: int, y: int, z: int) -> FakeBlock | None:
         if y < -64 or y > 319:
@@ -44,6 +45,23 @@ class FakeChunk:
             return FakeBlock("minecraft", "dirt")
         return FakeBlock("minecraft", "stone")
 
+    def get_section(self, section_y: int) -> object | None:
+        return object()
+
+    def stream_blocks(self, section: int | None = None, force_new: bool = False):
+        assert section is not None
+        self.loaded_sections.append(section)
+        base_y = section * 16
+        for local_y in range(16):
+            world_y = base_y + local_y
+            for z in range(16):
+                for x in range(16):
+                    block = self.get_block(x, world_y, z)
+                    if block is None:
+                        yield FakeBlock("minecraft", "air")
+                    else:
+                        yield block
+
 
 class FakeRegion:
     @classmethod
@@ -59,6 +77,33 @@ class FakeAnvil:
         def from_region(region: FakeRegion, local_x: int, local_z: int) -> FakeChunk:
             if local_x == 0 and local_z == 0:
                 return FakeChunk()
+
+            class ChunkNotFound(Exception):
+                pass
+
+            raise ChunkNotFound("missing")
+
+
+class MixedChunk(FakeChunk):
+    def get_block(self, x: int, y: int, z: int) -> FakeBlock | None:
+        if x == 0 and z == 0:
+            if y > 120:
+                return None
+            if y >= 112:
+                return FakeBlock("minecraft", "water")
+            if y == 111:
+                return FakeBlock("minecraft", "sand")
+            return FakeBlock("minecraft", "stone")
+        return super().get_block(x, y, z)
+
+
+class MixedAnvil(FakeAnvil):
+    class Chunk:
+        @staticmethod
+        def from_region(region: FakeRegion, local_x: int, local_z: int) -> MixedChunk:
+            if local_x == 0 and local_z == 0:
+                return MixedChunk()
+
             class ChunkNotFound(Exception):
                 pass
 
@@ -143,6 +188,43 @@ def test_export_pipeline_reader_vocab_and_visualization(monkeypatch, tmp_path) -
     overview = Image.open(render_dir / "overview.png")
     assert overview.width > 0
     assert overview.height > 0
+
+
+def test_reader_uses_section_cache_and_ignores_water_surface(monkeypatch) -> None:
+    monkeypatch.setattr(reader, "anvil", MixedAnvil)
+
+    chunk_ref = reader.ChunkRef(
+        region_path=reader.Path("r.0.0.mca"),
+        chunk_x=0,
+        chunk_z=0,
+        local_x=0,
+        local_z=0,
+    )
+    stats = reader.ReaderStats()
+    chunk_data = reader.read_chunk(chunk_ref, stats)
+
+    assert chunk_data is not None
+    assert chunk_data.surface_y.dtype == np.int16
+    assert chunk_data.blocks.dtype == np.int8
+    assert chunk_data.surface_y[0, 0] == 111
+    assert chunk_data.blocks[0, 0, 32] == encode("minecraft:sand")
+    assert np.all(chunk_data.blocks >= 0)
+    assert np.all(chunk_data.blocks < NUM_CLASSES)
+
+
+def test_reader_skips_upper_air_sections(monkeypatch) -> None:
+    monkeypatch.setattr(reader, "anvil", FakeAnvil)
+    chunk = FakeChunk()
+    sampler = reader._BlockSampler(chunk)
+
+    anchor_y = reader._find_surface_y(sampler, 0, 0)
+
+    assert anchor_y == 88
+    assert 19 in chunk.loaded_sections
+    assert 18 in chunk.loaded_sections
+    assert 6 in chunk.loaded_sections
+    assert 5 in chunk.loaded_sections
+    assert 4 not in chunk.loaded_sections
 
 
 def test_run_export_resolves_save_root_to_overworld(tmp_path) -> None:
