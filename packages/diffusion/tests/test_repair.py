@@ -65,6 +65,15 @@ def test_repair_dataset_features_and_unknown_material(tmp_path) -> None:
     assert sample["target_support"].min().item() >= 0.0
     assert sample["target_support"].max().item() <= 1.0
 
+    terrain_dataset = TerrainRepairDataset(export_dir, tile_size=128, mask_mode="terrain_mixed", seed=11, cache_arrays=False)
+    epoch_zero_mask = terrain_dataset[0]["mask"]
+    terrain_dataset.set_mask_epoch(1)
+    epoch_one_mask = terrain_dataset[0]["mask"]
+    assert epoch_zero_mask.shape == (1, 128, 128)
+    assert epoch_zero_mask.sum().item() > 0
+    assert epoch_one_mask.sum().item() > 0
+    assert not torch.equal(epoch_zero_mask, epoch_one_mask)
+
 
 def test_repair_model_training_and_checkpoint_roundtrip(tmp_path) -> None:
     export_dir = tmp_path / "export"

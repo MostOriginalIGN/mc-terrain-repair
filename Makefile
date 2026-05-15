@@ -24,6 +24,12 @@ BATCH_SIZE ?= 2
 LEARNING_RATE ?= 1e-4
 TRAIN_TILE_SIZE ?= 128
 STRIDE_CHUNKS ?= 1
+REPAIR_MASK_MODE ?= terrain_mixed
+AMP ?= auto
+NUM_WORKERS ?= 0
+GRAD_CLIP_NORM ?= 1.0
+COMPILE ?=
+CHANNELS_LAST ?=
 INFER_TILE_SIZE ?= 128
 OVERLAP ?= 32
 NUM_STEPS ?=
@@ -43,7 +49,7 @@ help:
 	@printf "  make export WORLD=... [OUT=...] [LIMIT=N] [WORKERS=N] [EXPORT_SEED=N]\n"
 	@printf "  make visualize [OUT=...]                       Render export validation images\n"
 	@printf "  make train [EPOCHS=...] [BATCH_SIZE=...] [RESUME=...] [SAVE_EVERY=N]\n"
-	@printf "  make train-repair [EPOCHS=...] [BATCH_SIZE=...] [RESUME=...] [SAVE_EVERY=N]\n"
+	@printf "  make train-repair [EPOCHS=...] [BATCH_SIZE=...] [AMP=auto|off|fp16|bf16] [COMPILE=1]\n"
 	@printf "  make prepare-infer [ORIGIN_CHUNK_X=...]        Build known_height/material/mask from exported chunks\n"
 	@printf "  make infer [CHECKPOINT=...] [INPUTS=...]       Run tiled diffusion inference\n"
 	@printf "  make repair [REPAIR_CHECKPOINT=...] [REPAIR_CASES=...] Run shared deterministic repair cases\n"
@@ -68,7 +74,7 @@ train:
 	uv run --package mc-terrain-diffusion python -m diffusion.training --export-dir "$(OUT)" --checkpoint "$(CHECKPOINT)" --epochs $(EPOCHS) --save-every $(SAVE_EVERY) --batch-size $(BATCH_SIZE) --learning-rate $(LEARNING_RATE) --tile-size $(TRAIN_TILE_SIZE) --stride-chunks $(STRIDE_CHUNKS) $(if $(RESUME),--resume "$(RESUME)",)
 
 train-repair:
-	uv run --package mc-terrain-diffusion python -m diffusion.repair_training --export-dir "$(OUT)" --checkpoint "$(REPAIR_CHECKPOINT)" --epochs $(EPOCHS) --save-every $(SAVE_EVERY) --batch-size $(BATCH_SIZE) --learning-rate $(LEARNING_RATE) --tile-size $(TRAIN_TILE_SIZE) --stride-chunks $(STRIDE_CHUNKS) $(if $(RESUME),--resume "$(RESUME)",)
+	uv run --package mc-terrain-diffusion python -m diffusion.repair_training --export-dir "$(OUT)" --checkpoint "$(REPAIR_CHECKPOINT)" --epochs $(EPOCHS) --save-every $(SAVE_EVERY) --batch-size $(BATCH_SIZE) --learning-rate $(LEARNING_RATE) --tile-size $(TRAIN_TILE_SIZE) --stride-chunks $(STRIDE_CHUNKS) --mask-mode "$(REPAIR_MASK_MODE)" --amp "$(AMP)" --num-workers $(NUM_WORKERS) --grad-clip-norm $(GRAD_CLIP_NORM) $(if $(COMPILE),--compile,) $(if $(CHANNELS_LAST),--channels-last,) $(if $(RESUME),--resume "$(RESUME)",)
 
 prepare-infer:
 	uv run --package mc-terrain-diffusion python scripts/prepare_infer_inputs.py --export-dir "$(OUT)" --out-dir "$(INPUTS)" --checkpoint "$(CHECKPOINT)" --tile-size $(INFER_TILE_SIZE) $(if $(ORIGIN_CHUNK_X),--origin-chunk-x $(ORIGIN_CHUNK_X),) $(if $(ORIGIN_CHUNK_Z),--origin-chunk-z $(ORIGIN_CHUNK_Z),) --mask-top $(MASK_TOP) --mask-left $(MASK_LEFT) --mask-height $(MASK_HEIGHT) --mask-width $(MASK_WIDTH)
