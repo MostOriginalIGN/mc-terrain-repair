@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=82"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mc-terrain-render"
+version = "0.1.0"
+description = "Simple pygame 3D viewer for repair case outputs"
+requires-python = ">=3.10,<3.15"
+dependencies = [
+    "numpy",
+    "pygame>=2.5",
+]
+
+[project.scripts]
+repair-3d = "repair_viewer.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

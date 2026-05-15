@@ -1,4 +1,4 @@
-"""Helpers for building diffusion inference inputs from exported terrain chunks."""
+"""Helpers for building U-Net repair inputs from exported terrain chunks."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from .data import CHUNK_SIZE, TerrainDiffusionDataset
+from .repair_data import compute_support_from_chunk
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,7 @@ def prepare_inference_inputs(
     surface = dataset._assemble_surface_window(resolved_origin_x, resolved_origin_z)
     target_height = dataset._normalize_height(surface)
     target_material = dataset._assemble_material_window(resolved_origin_x, resolved_origin_z)
+    target_support = _assemble_support_window(dataset, resolved_origin_x, resolved_origin_z)
 
     mask = np.zeros((tile_size, tile_size), dtype=np.float32)
     bottom = mask_top + mask_height
@@ -152,12 +154,15 @@ def prepare_inference_inputs(
     known_height = target_height * (1.0 - mask)
     known_material = target_material.copy()
     known_material[mask.astype(bool)] = 0
+    known_support = target_support * (1.0 - mask)
 
     np.save(out_path / 'known_height.npy', known_height.astype(np.float32))
     np.save(out_path / 'known_material.npy', known_material.astype(np.int64))
+    np.save(out_path / 'known_support.npy', known_support.astype(np.float32))
     np.save(out_path / 'mask.npy', mask.astype(np.float32))
     np.save(out_path / 'target_height.npy', target_height.astype(np.float32))
     np.save(out_path / 'target_material.npy', target_material.astype(np.int64))
+    np.save(out_path / 'target_support.npy', target_support.astype(np.float32))
 
     metadata = {
         'origin_chunk_x': resolved_origin_x,
@@ -173,3 +178,15 @@ def prepare_inference_inputs(
     }
     (out_path / 'metadata.json').write_text(json.dumps(metadata, indent=2) + '\n', encoding='utf-8')
     return metadata
+
+
+def _assemble_support_window(dataset: TerrainDiffusionDataset, origin_x: int, origin_z: int) -> np.ndarray:
+    window = np.zeros((dataset.tile_size, dataset.tile_size), dtype=np.float32)
+    for dx in range(dataset.chunks_per_side):
+        for dz in range(dataset.chunks_per_side):
+            coord = (origin_x + dx, origin_z + dz)
+            tile = compute_support_from_chunk(dataset._load_chunk(coord)).T
+            row = dz * CHUNK_SIZE
+            col = dx * CHUNK_SIZE
+            window[row:row + CHUNK_SIZE, col:col + CHUNK_SIZE] = tile
+    return window

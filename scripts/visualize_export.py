@@ -17,7 +17,7 @@ src_path = str(EXPORTER_SRC)
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from exporter.visualize import (
+from exporter.visualize import (  # noqa: E402
     render_colormap,
     render_cross_section,
     render_export_colormap,
@@ -26,6 +26,22 @@ from exporter.visualize import (
 )
 
 SURFACE_FILENAME_RE = re.compile(r"^surface_(-?\d+)_(-?\d+)\.npy$")
+
+
+def _is_export_dir(path: Path) -> bool:
+    return path.is_dir() and any(path.glob("surface_*.npy")) and any(path.glob("chunk_*.npy"))
+
+
+def _resolve_export_dirs(export_dir: Path) -> list[Path]:
+    if _is_export_dir(export_dir):
+        return [export_dir]
+    child_exports = sorted(child.resolve() for child in export_dir.iterdir() if _is_export_dir(child))
+    if child_exports:
+        return child_exports
+    raise SystemExit(
+        f"No export directories found at {export_dir}. Expected either a directory containing "
+        "surface_*.npy/chunk_*.npy files or a parent directory whose immediate children are export directories."
+    )
 
 
 def _discover_surface_files(export_dir: Path) -> list[tuple[int, int, Path]]:
@@ -104,43 +120,47 @@ def main() -> None:
     export_dir = Path(args.export_dir).expanduser().resolve()
     if not export_dir.is_dir():
         raise SystemExit(f"Export directory does not exist: {export_dir}")
+    export_dirs = _resolve_export_dirs(export_dir)
 
-    out_dir = (
-        Path(args.out_dir).expanduser().resolve()
-        if args.out_dir is not None
-        else (export_dir / "renders").resolve()
-    )
-    out_dir.mkdir(parents=True, exist_ok=True)
+    base_out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir is not None else None
+    print(f"Visualizing {len(export_dirs)} world{'s' if len(export_dirs) != 1 else ''}")
+    for current_export_dir in export_dirs:
+        out_dir = (
+            (base_out_dir / current_export_dir.name).resolve()
+            if base_out_dir is not None and len(export_dirs) > 1
+            else (base_out_dir.resolve() if base_out_dir is not None else (current_export_dir / "renders").resolve())
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    heightmap_out = (
-        Path(args.heightmap_out).expanduser().resolve()
-        if args.heightmap_out is not None
-        else out_dir / "overview_heightmap.png"
-    )
-    colormap_out = (
-        Path(args.colormap_out).expanduser().resolve()
-        if args.colormap_out is not None
-        else out_dir / "overview_colormap.png"
-    )
+        heightmap_out = (
+            Path(args.heightmap_out).expanduser().resolve()
+            if args.heightmap_out is not None and len(export_dirs) == 1
+            else out_dir / "overview_heightmap.png"
+        )
+        colormap_out = (
+            Path(args.colormap_out).expanduser().resolve()
+            if args.colormap_out is not None and len(export_dirs) == 1
+            else out_dir / "overview_colormap.png"
+        )
 
-    rendered, image_size = render_export_heightmap(export_dir, heightmap_out)
-    rendered_color, color_image_size = render_export_colormap(export_dir, colormap_out)
-    preview_count = _render_sample_previews(
-        export_dir=export_dir,
-        out_dir=out_dir,
-        sample_count=args.sample_count,
-        z_slice=args.z_slice,
-        seed=args.seed,
-    )
-    print(
-        f"Rendered stitched height map from {rendered} chunks to {heightmap_out} "
-        f"at {image_size[0]}x{image_size[1]}"
-    )
-    print(
-        f"Rendered stitched color map from {rendered_color} chunks to {colormap_out} "
-        f"at {color_image_size[0]}x{color_image_size[1]}"
-    )
-    print(f"Rendered {preview_count} sample chunk previews to {out_dir / 'samples'}")
+        rendered, image_size = render_export_heightmap(current_export_dir, heightmap_out)
+        rendered_color, color_image_size = render_export_colormap(current_export_dir, colormap_out)
+        preview_count = _render_sample_previews(
+            export_dir=current_export_dir,
+            out_dir=out_dir,
+            sample_count=args.sample_count,
+            z_slice=args.z_slice,
+            seed=args.seed,
+        )
+        print(
+            f"[{current_export_dir.name}] Rendered stitched height map from {rendered} chunks to {heightmap_out} "
+            f"at {image_size[0]}x{image_size[1]}"
+        )
+        print(
+            f"[{current_export_dir.name}] Rendered stitched color map from {rendered_color} chunks to {colormap_out} "
+            f"at {color_image_size[0]}x{color_image_size[1]}"
+        )
+        print(f"[{current_export_dir.name}] Rendered {preview_count} sample chunk previews to {out_dir / 'samples'}")
 
 
 if __name__ == "__main__":

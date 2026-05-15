@@ -14,7 +14,7 @@ for src_path in (str(EXPORTER_SRC), str(DATASET_SRC)):
     if src_path not in sys.path:
         sys.path.insert(0, src_path)
 
-from exporter.export import export_chunks
+from exporter.export import export_chunks  # noqa: E402
 
 OVERWORLD_RELATIVE_PATH = Path('dimensions/minecraft/overworld')
 
