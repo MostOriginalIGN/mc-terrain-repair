@@ -28,6 +28,39 @@ from .repair_data import (
 from .repair_model import TerrainRepairUNet
 
 
+def is_export_dir(path: str | Path) -> bool:
+    candidate = Path(path).expanduser().resolve()
+    if not candidate.is_dir():
+        return False
+    return any(candidate.glob("surface_*.npy")) and any(candidate.glob("chunk_*.npy"))
+
+
+def resolve_training_export_dirs(export_dirs: list[str]) -> list[Path]:
+    resolved_inputs = TerrainRepairDataset._resolve_export_dirs(export_dirs)
+    expanded: list[Path] = []
+    for path in resolved_inputs:
+        if is_export_dir(path):
+            if path not in expanded:
+                expanded.append(path)
+            continue
+        child_exports = sorted(
+            child.resolve()
+            for child in path.iterdir()
+            if child.is_dir() and is_export_dir(child)
+        )
+        if child_exports:
+            for child in child_exports:
+                if child not in expanded:
+                    expanded.append(child)
+            continue
+        raise SystemExit(
+            f"No export directories found at {path}. "
+            "Pass an export directory containing surface_*.npy/chunk_*.npy files, "
+            "or a parent directory whose immediate children are export directories."
+        )
+    return expanded
+
+
 @dataclass
 class RepairLossOutput:
     total_loss: torch.Tensor
@@ -323,13 +356,15 @@ def build_repair_checkpoint_meta(
     state: RepairTrainingState,
     interrupted: bool,
 ) -> dict[str, object]:
+    export_dirs = [str(path) for path in dataset.export_dirs]
     return {
         "model_type": "deterministic_repair_v1",
         "tile_size": args.tile_size,
         "stride_chunks": args.stride_chunks,
         "height_min": dataset.height_min,
         "height_max": dataset.height_max,
-        "export_dir": str(Path(args.export_dir).resolve()),
+        "export_dir": export_dirs[0],
+        "export_dirs": export_dirs,
         "epoch": state.completed_epochs,
         "global_step": state.global_step,
         "interrupted": interrupted,
@@ -509,7 +544,12 @@ def evaluate_repair_cases(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train deterministic surface terrain repair.")
-    parser.add_argument("--export-dir", required=True, help="Directory containing exported chunk and surface arrays")
+    parser.add_argument(
+        "--export-dir",
+        action="append",
+        required=True,
+        help="Export directory containing chunk/surface arrays. Repeat the flag or pass a comma-separated list to mix multiple exports.",
+    )
     parser.add_argument("--checkpoint", required=True, help="Output checkpoint path")
     parser.add_argument("--latest-checkpoint", default=None, help="Optional latest-checkpoint path; defaults beside --checkpoint")
     parser.add_argument("--best-checkpoint", default=None, help="Optional best-checkpoint path; defaults beside --checkpoint")
@@ -536,6 +576,7 @@ def main() -> None:
     parser.add_argument("--validate-every", type=int, default=1, help="Validate every N epochs when validation cases are configured.")
     parser.add_argument("--tensorboard-dir", default=None, help="Write TensorBoard logs to this directory.")
     args = parser.parse_args()
+    training_export_dirs = resolve_training_export_dirs(args.export_dir)
 
     device = select_training_device(args.device)
     configure_cuda_backend(device, args.tf32, args.cudnn_benchmark)
@@ -545,7 +586,7 @@ def main() -> None:
     best_checkpoint = Path(args.best_checkpoint) if args.best_checkpoint else checkpoint_sibling(args.checkpoint, "best")
     writer = create_summary_writer(args.tensorboard_dir)
     dataset = TerrainRepairDataset(
-        args.export_dir,
+        training_export_dirs,
         tile_size=args.tile_size,
         stride_chunks=args.stride_chunks,
         mask_mode=args.mask_mode,
@@ -600,7 +641,11 @@ def main() -> None:
         print(f"Using AMP dtype={amp_config.dtype}")
     if args.channels_last:
         print("Using channels-last memory format")
-    print(f"Training on {device}; grad_accum_steps={max(1, args.grad_accum_steps)}")
+    print(f"Training on {len(dataset.export_dirs)} world{'s' if len(dataset.export_dirs) != 1 else ''}")
+    print(
+        f"Training on {device}; grad_accum_steps={max(1, args.grad_accum_steps)}; "
+        f"exports={len(dataset.export_dirs)}; windows={len(dataset)}"
+    )
 
     model.train()
     progress: tqdm | None = None

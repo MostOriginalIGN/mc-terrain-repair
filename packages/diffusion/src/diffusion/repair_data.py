@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 import torch
@@ -140,7 +141,7 @@ class TerrainRepairDataset(TerrainDiffusionDataset):
 
     def __init__(
         self,
-        export_dir: str | Path,
+        export_dir: str | Path | Iterable[str | Path],
         tile_size: int = 128,
         stride_chunks: int = 1,
         mask_mode: str = "mixed",
@@ -168,10 +169,11 @@ class TerrainRepairDataset(TerrainDiffusionDataset):
         self.mask_epoch = int(epoch)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        export_id = self.window_export_ids[index]
         origin_x, origin_z = self.window_origins[index]
-        surface = self._assemble_surface_window(origin_x, origin_z)
-        materials = self._assemble_material_window(origin_x, origin_z)
-        support = self._assemble_support_window(origin_x, origin_z)
+        surface = self._assemble_surface_window(origin_x, origin_z, export_id=export_id)
+        materials = self._assemble_material_window(origin_x, origin_z, export_id=export_id)
+        support = self._assemble_support_window(origin_x, origin_z, export_id=export_id)
 
         target_height = self._normalize_height(surface).astype(np.float32)
         mask = self._build_mask(index, target_height=target_height, materials=materials, support=support)
@@ -384,12 +386,13 @@ class TerrainRepairDataset(TerrainDiffusionDataset):
         flat_index = int(rng.choice(weights.size, p=weights))
         return divmod(flat_index, self.tile_size)
 
-    def _assemble_support_window(self, origin_x: int, origin_z: int) -> np.ndarray:
+    def _assemble_support_window(self, origin_x: int, origin_z: int, export_id: int | None = None) -> np.ndarray:
+        resolved_export_id = self._resolve_export_id_for_origin(origin_x, origin_z) if export_id is None else export_id
         window = np.zeros((self.tile_size, self.tile_size), dtype=np.float32)
         for dx in range(self.chunks_per_side):
             for dz in range(self.chunks_per_side):
                 coord = (origin_x + dx, origin_z + dz)
-                tile = compute_support_from_chunk(self._load_chunk(coord)).T
+                tile = compute_support_from_chunk(self._load_chunk(coord, export_id=resolved_export_id)).T
                 row = dz * CHUNK_SIZE
                 col = dx * CHUNK_SIZE
                 window[row:row + CHUNK_SIZE, col:col + CHUNK_SIZE] = tile

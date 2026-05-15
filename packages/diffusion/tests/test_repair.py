@@ -18,21 +18,29 @@ from diffusion.repair_training import (
     compute_repair_losses,
     evaluate_repair_cases,
     load_repair_checkpoint,
+    resolve_training_export_dirs,
     save_repair_checkpoint,
     train_repair_step,
 )
 from exporter.vocab import UNKNOWN_INDEX
 
 
-def _write_fake_export(export_dir: Path, width_chunks: int = 8, height_chunks: int = 8) -> None:
+def _write_fake_export(
+    export_dir: Path,
+    width_chunks: int = 8,
+    height_chunks: int = 8,
+    *,
+    height_base: int = 64,
+    surface_material: int | None = None,
+) -> None:
     for chunk_x in range(width_chunks):
         for chunk_z in range(height_chunks):
-            surface = np.full((16, 16), 64 + chunk_x + chunk_z, dtype=np.int16)
+            surface = np.full((16, 16), height_base + chunk_x + chunk_z, dtype=np.int16)
             blocks = np.zeros((16, 16, 40), dtype=np.int8)
             blocks[:, :, :32] = 4
             if (chunk_x + chunk_z) % 3 == 0:
                 blocks[:, :, 8:24] = 0
-            blocks[:, :, 32] = (chunk_x * height_chunks + chunk_z) % 16
+            blocks[:, :, 32] = surface_material if surface_material is not None else (chunk_x * height_chunks + chunk_z) % 16
             np.save(export_dir / f"surface_{chunk_x}_{chunk_z}.npy", surface)
             np.save(export_dir / f"chunk_{chunk_x}_{chunk_z}.npy", blocks)
 
@@ -74,6 +82,41 @@ def test_repair_dataset_features_and_unknown_material(tmp_path) -> None:
     assert epoch_zero_mask.sum().item() > 0
     assert epoch_one_mask.sum().item() > 0
     assert not torch.equal(epoch_zero_mask, epoch_one_mask)
+
+
+def test_repair_dataset_keeps_multi_export_windows_separate(tmp_path) -> None:
+    export_a = tmp_path / "export_a"
+    export_b = tmp_path / "export_b"
+    export_a.mkdir()
+    export_b.mkdir()
+    _write_fake_export(export_a, width_chunks=8, height_chunks=8, height_base=40, surface_material=2)
+    _write_fake_export(export_b, width_chunks=8, height_chunks=8, height_base=90, surface_material=9)
+
+    dataset = TerrainRepairDataset([export_a, export_b], tile_size=128, mask_mode="none", cache_arrays=False)
+
+    assert len(dataset) == 2
+    sample_a = dataset[0]
+    sample_b = dataset[1]
+    assert sample_a["target_material"].unique().tolist() == [2]
+    assert sample_b["target_material"].unique().tolist() == [9]
+    assert sample_a["target_height"].mean().item() < sample_b["target_height"].mean().item()
+
+
+def test_resolve_training_export_dirs_from_parent_directory(tmp_path) -> None:
+    exports_root = tmp_path / "exports"
+    export_a = exports_root / "world_a"
+    export_b = exports_root / "world_b"
+    export_c = exports_root / "notes"
+    export_a.mkdir(parents=True)
+    export_b.mkdir(parents=True)
+    export_c.mkdir(parents=True)
+    _write_fake_export(export_a, width_chunks=8, height_chunks=8, height_base=50)
+    _write_fake_export(export_b, width_chunks=8, height_chunks=8, height_base=80)
+    (export_c / "readme.txt").write_text("not an export", encoding="utf-8")
+
+    resolved = resolve_training_export_dirs([str(exports_root)])
+
+    assert resolved == [export_a.resolve(), export_b.resolve()]
 
 
 def test_repair_model_training_and_checkpoint_roundtrip(tmp_path) -> None:
@@ -120,7 +163,7 @@ def test_repair_model_training_and_checkpoint_roundtrip(tmp_path) -> None:
     args = type("Args", (), {
         "tile_size": 128,
         "stride_chunks": 1,
-        "export_dir": str(export_dir),
+        "export_dir": [str(export_dir)],
     })()
     meta = build_repair_checkpoint_meta(args, dataset, RepairTrainingState(completed_epochs=2, global_step=12), interrupted=False)
     save_repair_checkpoint(checkpoint, model, optimizer, meta=meta)
@@ -130,6 +173,7 @@ def test_repair_model_training_and_checkpoint_roundtrip(tmp_path) -> None:
     assert payload["meta"]["model_type"] == "deterministic_repair_v1"
     assert payload["meta"]["epoch"] == 2
     assert payload["meta"]["global_step"] == 12
+    assert payload["meta"]["export_dirs"] == [str(export_dir.resolve())]
 
     bad_checkpoint = tmp_path / "bad_repair.pt"
     bad_checkpoint.write_bytes(b"not a torch checkpoint")

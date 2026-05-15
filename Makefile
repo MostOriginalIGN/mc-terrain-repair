@@ -53,7 +53,7 @@ help:
 	@printf "  make test                                      Run exporter and repair tests\n"
 	@printf "  make export WORLD=... [OUT=...] [LIMIT=N] [WORKERS=N] [EXPORT_SEED=N]\n"
 	@printf "  make visualize [OUT=...]                       Render export validation images\n"
-	@printf "  make train [EPOCHS=...] [BATCH_SIZE=...] [DEVICE=cuda] [AMP=auto|off|fp16|bf16] [TENSORBOARD=1]\n"
+	@printf "  make train [OUT=./data/exports] [EPOCHS=...] [BATCH_SIZE=...] [DEVICE=cuda] [AMP=auto|off|fp16|bf16] [TENSORBOARD=1]\n"
 	@printf "  make prepare-infer [ORIGIN_CHUNK_X=...]        Build known_height/material/mask from exported chunks\n"
 	@printf "  make infer [REPAIR_CHECKPOINT=...] [INPUTS=...] Run U-Net repair on prepared scratch inputs\n"
 	@printf "  make repair [REPAIR_CHECKPOINT=...] [REPAIR_CASES=...] Run shared deterministic repair cases\n"
