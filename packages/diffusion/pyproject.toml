@@ -6,9 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "mc-terrain-diffusion"
 version = "0.1.0"
 description = "Minecraft surface terrain export and deterministic U-Net repair for Vanilla-style infill."
-requires-python = ">=3.10,<3.15"
+requires-python = ">=3.11,<3.15"
 dependencies = [
     "torch",
+    "lightning==2.6.1",
+    "litlogger>=2026.5.12",
     "tensorboard",
     "numpy",
     "tqdm",
@@ -18,6 +20,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+
+[project.scripts]
+train-terrain-repair = "diffusion.repair_lightning:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

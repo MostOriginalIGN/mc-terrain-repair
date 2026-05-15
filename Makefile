@@ -28,7 +28,7 @@ STRIDE_CHUNKS ?= 1
 REPAIR_MASK_MODE ?= terrain_mixed
 AMP ?= auto
 DEVICE ?= auto
-NUM_WORKERS ?= 0
+NUM_WORKERS ?= -1
 GRAD_CLIP_NORM ?= 1.0
 GRAD_ACCUM_STEPS ?= 1
 VALIDATE_EVERY ?= 1
@@ -37,6 +37,18 @@ TENSORBOARD ?=
 COMPILE ?=
 CHANNELS_LAST ?=
 TF32 ?= auto
+LIGHTNING_ACCELERATOR ?= auto
+LIGHTNING_DEVICES ?= 1
+LIGHTNING_STRATEGY ?= auto
+LIGHTNING_PRECISION ?=
+LIGHTNING_ROOT ?= ./artifacts/lightning
+LIGHTNING_CKPT ?=
+LITLOGGER_NAME ?=
+LITLOGGER_TEAMSPACE ?=
+LITLOGGER_ROOT ?=
+LITLOGGER_METADATA ?=
+LITLOGGER_LOG_MODEL ?=
+LITLOGGER_NO_SAVE_LOGS ?=
 INFER_TILE_SIZE ?= 128
 ORIGIN_CHUNK_X ?=
 ORIGIN_CHUNK_Z ?=
@@ -45,7 +57,7 @@ MASK_LEFT ?= 48
 MASK_HEIGHT ?= 32
 MASK_WIDTH ?= 32
 
-.PHONY: help sync test export visualize train prepare-infer infer repair repair-case infer-gui view-repair
+.PHONY: help sync test export visualize train train-lightning train-legacy prepare-infer infer repair repair-case infer-gui view-repair
 
 help:
 	@printf "Targets:\n"
@@ -53,7 +65,10 @@ help:
 	@printf "  make test                                      Run exporter and repair tests\n"
 	@printf "  make export WORLD=... [OUT=...] [LIMIT=N] [WORKERS=N] [EXPORT_SEED=N]\n"
 	@printf "  make visualize [OUT=./data/exports]            Render export validation images\n"
-	@printf "  make train [OUT=./data/exports] [EPOCHS=...] [BATCH_SIZE=...] [DEVICE=cuda] [AMP=auto|off|fp16|bf16] [TENSORBOARD=1]\n"
+	@printf "  make train [OUT=...] [EPOCHS=...] [BATCH_SIZE=...] [LIGHTNING_DEVICES=1] [AMP=auto|off|fp16|bf16]\n"
+	@printf "            PyTorch Lightning + LitLogger; optional: [LITLOGGER_NAME=...] [LITLOGGER_TEAMSPACE=user/ts]\n"
+	@printf "            [LITLOGGER_ROOT=path] [LITLOGGER_METADATA='k=v'] [LITLOGGER_LOG_MODEL=1]\n"
+	@printf "  make train-legacy …                            Plain PyTorch loop + optional TensorBoard\n"
 	@printf "  make prepare-infer [ORIGIN_CHUNK_X=...]        Build known_height/material/mask from exported chunks\n"
 	@printf "  make infer [REPAIR_CHECKPOINT=...] [INPUTS=...] Run U-Net repair on prepared scratch inputs\n"
 	@printf "  make repair [REPAIR_CHECKPOINT=...] [REPAIR_CASES=...] Run shared deterministic repair cases\n"
@@ -74,6 +89,44 @@ visualize:
 	uv run --package mc-terrain-exporter python scripts/visualize_export.py --export-dir "$(OUT)" --out-dir "$(RENDERS)" --sample-count $(SAMPLE_COUNT) --seed $(SEED)
 
 train:
+	uv run --package mc-terrain-diffusion train-terrain-repair \
+		--export-dir "$(OUT)" \
+		--checkpoint "$(REPAIR_CHECKPOINT)" \
+		--latest-checkpoint "$(REPAIR_LATEST_CHECKPOINT)" \
+		--best-checkpoint "$(REPAIR_BEST_CHECKPOINT)" \
+		--epochs $(EPOCHS) \
+		--save-every $(SAVE_EVERY) \
+		--batch-size $(BATCH_SIZE) \
+		--grad-accum-steps $(GRAD_ACCUM_STEPS) \
+		--learning-rate $(LEARNING_RATE) \
+		--tile-size $(TRAIN_TILE_SIZE) \
+		--stride-chunks $(STRIDE_CHUNKS) \
+		--mask-mode "$(REPAIR_MASK_MODE)" \
+		--amp "$(AMP)" \
+		--accelerator "$(LIGHTNING_ACCELERATOR)" \
+		--devices "$(LIGHTNING_DEVICES)" \
+		--strategy "$(LIGHTNING_STRATEGY)" \
+		--num-workers $(NUM_WORKERS) \
+		--grad-clip-norm $(GRAD_CLIP_NORM) \
+		--validation-cases-dir "$(REPAIR_CASES)" \
+		--validate-every $(VALIDATE_EVERY) \
+		--tf32 "$(TF32)" \
+		--lightning-root-dir "$(LIGHTNING_ROOT)" \
+		$(if $(LIGHTNING_PRECISION),--precision "$(LIGHTNING_PRECISION)",) \
+		$(if $(LITLOGGER_NAME),--litlogger-name "$(LITLOGGER_NAME)",) \
+		$(if $(LITLOGGER_TEAMSPACE),--litlogger-teamspace "$(LITLOGGER_TEAMSPACE)",) \
+		$(if $(LITLOGGER_ROOT),--litlogger-root-dir "$(LITLOGGER_ROOT)",) \
+		$(foreach kv,$(LITLOGGER_METADATA),--litlogger-metadata "$(kv)") \
+		$(if $(LITLOGGER_LOG_MODEL),--litlogger-log-model,) \
+		$(if $(LITLOGGER_NO_SAVE_LOGS),--no-litlogger-save-logs,) \
+		$(if $(COMPILE),--compile,) \
+		$(if $(CHANNELS_LAST),--channels-last,) \
+		$(if $(RESUME),--resume "$(RESUME)",) \
+		$(if $(LIGHTNING_CKPT),--ckpt-path "$(LIGHTNING_CKPT)",)
+
+train-lightning: train
+
+train-legacy:
 	uv run --package mc-terrain-diffusion python -m diffusion.repair_training --export-dir "$(OUT)" --checkpoint "$(REPAIR_CHECKPOINT)" --latest-checkpoint "$(REPAIR_LATEST_CHECKPOINT)" --best-checkpoint "$(REPAIR_BEST_CHECKPOINT)" --epochs $(EPOCHS) --save-every $(SAVE_EVERY) --batch-size $(BATCH_SIZE) --grad-accum-steps $(GRAD_ACCUM_STEPS) --learning-rate $(LEARNING_RATE) --tile-size $(TRAIN_TILE_SIZE) --stride-chunks $(STRIDE_CHUNKS) --mask-mode "$(REPAIR_MASK_MODE)" --device "$(DEVICE)" --amp "$(AMP)" --num-workers $(NUM_WORKERS) --grad-clip-norm $(GRAD_CLIP_NORM) --validation-cases-dir "$(REPAIR_CASES)" --validate-every $(VALIDATE_EVERY) --tf32 "$(TF32)" $(if $(TENSORBOARD),--tensorboard-dir "$(TENSORBOARD_DIR)",) $(if $(COMPILE),--compile,) $(if $(CHANNELS_LAST),--channels-last,) $(if $(RESUME),--resume "$(RESUME)",)
 
 prepare-infer:

@@ -11,6 +11,7 @@ from diffusion.infer_inputs import prepare_inference_inputs
 from diffusion.repair_data import TerrainRepairDataset
 from diffusion.repair_inference import run_repair_job, run_saved_case_jobs
 from diffusion.repair_inference import main as repair_inference_main
+from diffusion.repair_lightning import TerrainRepairDataModule, TerrainRepairLightningModule
 from diffusion.repair_model import TerrainRepairUNet
 from diffusion.repair_training import (
     RepairTrainingState,
@@ -179,6 +180,30 @@ def test_repair_model_training_and_checkpoint_roundtrip(tmp_path) -> None:
     bad_checkpoint.write_bytes(b"not a torch checkpoint")
     with pytest.raises(RuntimeError, match="Could not load repair checkpoint"):
         load_repair_checkpoint(bad_checkpoint, reloaded)
+
+
+def test_lightning_module_training_step(tmp_path) -> None:
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    _write_fake_export(export_dir, width_chunks=8, height_chunks=8)
+
+    datamodule = TerrainRepairDataModule(
+        export_dirs=[export_dir],
+        tile_size=128,
+        stride_chunks=1,
+        mask_mode="rectangle",
+        batch_size=1,
+        num_workers=0,
+    )
+    datamodule.setup("fit")
+    assert datamodule.dataset is not None
+
+    batch = _batch_from_sample(datamodule.dataset[0])
+    module = TerrainRepairLightningModule(num_material_classes=datamodule.dataset.num_material_classes)
+    loss = module.training_step(batch, batch_idx=0)
+
+    assert torch.isfinite(loss)
+    assert loss.item() > 0
 
 
 def test_repair_inference_outputs_and_preserves_known_pixels(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
