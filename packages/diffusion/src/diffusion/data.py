@@ -1,4 +1,4 @@
-"""Dataset assembly for terrain diffusion training."""
+"""Shared terrain tile dataset assembly for Minecraft repair training."""
 
 from __future__ import annotations
 

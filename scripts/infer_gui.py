@@ -1,4 +1,4 @@
-"""Local GUI for selecting a chunk region and running terrain regeneration."""
+"""Local GUI for selecting a chunk region and running deterministic terrain repair."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ for src_path in (str(DIFFUSION_SRC), str(EXPORTER_SRC), str(DATASET_SRC)):
 
 from diffusion.data import TerrainDiffusionDataset  # noqa: E402
 from diffusion.infer_inputs import SelectionPlan, plan_chunk_selection, prepare_inference_inputs  # noqa: E402
-from diffusion.inference import run_inference_job  # noqa: E402
+from diffusion.repair_inference import run_repair_job  # noqa: E402
 from exporter.visualize import heightmap_image, material_map_image  # noqa: E402
 
 
@@ -38,15 +38,67 @@ def _safe_case_name(name: str) -> str:
     return safe or "repair_case"
 
 
-def _height_image_with_water(heightmap: np.ndarray, mask: np.ndarray | None = None, upscale: int = 1) -> Image.Image:
-    image = heightmap_image(heightmap, mask=mask, upscale=upscale).convert("RGB")
-    water_mask = heightmap < SEA_LEVEL_Y
+def _draw_mask_box(image: Image.Image, mask: np.ndarray, outline: tuple[int, int, int] = (255, 36, 36), width: int = 2) -> Image.Image:
+    bounds = np.argwhere(mask > 0)
+    if bounds.size == 0:
+        return image
+    top = int(bounds[:, 0].min())
+    left = int(bounds[:, 1].min())
+    bottom = int(bounds[:, 0].max())
+    right = int(bounds[:, 1].max())
+    scale_x = image.width / mask.shape[1]
+    scale_y = image.height / mask.shape[0]
+    boxed = image.copy()
+    draw = ImageDraw.Draw(boxed)
+    draw.rectangle(
+        (
+            int(round(left * scale_x)),
+            int(round(top * scale_y)),
+            int(round((right + 1) * scale_x)) - 1,
+            int(round((bottom + 1) * scale_y)) - 1,
+        ),
+        outline=outline,
+        width=max(width, int(round(min(scale_x, scale_y)))),
+    )
+    return boxed
+
+
+def _height_image_with_water(
+    heightmap: np.ndarray,
+    mask: np.ndarray | None = None,
+    upscale: int = 1,
+    valid_mask: np.ndarray | None = None,
+    sea_level: float | None = SEA_LEVEL_Y,
+) -> Image.Image:
+    if valid_mask is None:
+        valid_mask = np.ones(heightmap.shape, dtype=bool)
+    else:
+        valid_mask = valid_mask.astype(bool)
+    if valid_mask.shape != heightmap.shape:
+        raise ValueError(f"valid_mask shape {valid_mask.shape} must match heightmap shape {heightmap.shape}")
+
+    valid_heights = heightmap[valid_mask]
+    fill_value = float(valid_heights.mean()) if valid_heights.size else 0.0
+    render_heightmap = np.where(valid_mask, heightmap, fill_value)
+    image = heightmap_image(render_heightmap, mask=None, upscale=upscale).convert("RGB")
+
+    use_sea_overlay = sea_level is not None and valid_heights.size > 0 and float(valid_heights.max()) > 2.0
+    water_mask = valid_mask & (heightmap < sea_level) if use_sea_overlay else np.zeros(heightmap.shape, dtype=bool)
     if water_mask.any():
         water_alpha = Image.fromarray((water_mask.astype(np.uint8) * 255), mode="L")
         if upscale > 1:
             water_alpha = water_alpha.resize(image.size, resample=Image.Resampling.NEAREST)
         water_layer = Image.new("RGB", image.size, (72, 145, 210))
         image = Image.composite(water_layer, image, water_alpha)
+    invalid_mask = ~valid_mask
+    if invalid_mask.any():
+        invalid_alpha = Image.fromarray((invalid_mask.astype(np.uint8) * 255), mode="L")
+        if upscale > 1:
+            invalid_alpha = invalid_alpha.resize(image.size, resample=Image.Resampling.NEAREST)
+        invalid_layer = Image.new("RGB", image.size, (36, 38, 40))
+        image = Image.composite(invalid_layer, image, invalid_alpha)
+    if mask is not None:
+        image = _draw_mask_box(image, mask)
     return image
 
 
@@ -103,7 +155,8 @@ def _build_selector_maps(dataset: TerrainDiffusionDataset) -> tuple[Image.Image,
     width_chunks = max_chunk_x - min_chunk_x + 1
     height_chunks = max_chunk_z - min_chunk_z + 1
     surface_window = np.zeros((height_chunks * 16, width_chunks * 16), dtype=np.float32)
-    material_window = np.zeros((height_chunks * 16, width_chunks * 16), dtype=np.int64)
+    material_window = np.full((height_chunks * 16, width_chunks * 16), 16, dtype=np.int64)
+    valid_window = np.zeros((height_chunks * 16, width_chunks * 16), dtype=bool)
 
     for chunk_x, chunk_z in coords:
         row = (chunk_z - min_chunk_z) * 16
@@ -112,12 +165,13 @@ def _build_selector_maps(dataset: TerrainDiffusionDataset) -> tuple[Image.Image,
         chunk_tile = dataset._load_chunk((chunk_x, chunk_z))[:, :, 32].T.astype(np.int64)
         surface_window[row:row + 16, col:col + 16] = surface_tile
         material_window[row:row + 16, col:col + 16] = chunk_tile
+        valid_window[row:row + 16, col:col + 16] = True
 
     return (
-        _height_image_with_water(surface_window),
+        _height_image_with_water(surface_window, valid_mask=valid_window),
         material_map_image(material_window),
         (min_chunk_x, min_chunk_z, max_chunk_x, max_chunk_z),
-        (float(surface_window.min()), float(surface_window.max())),
+        (float(surface_window[valid_window].min()), float(surface_window[valid_window].max())),
     )
 
 
@@ -151,8 +205,6 @@ class InferenceSelectionApp:
         repair_cases_dir: Path,
         out_dir: Path,
         tile_size: int,
-        overlap: int,
-        num_steps: int | None,
     ) -> None:
         import tkinter as tk
         from tkinter import messagebox
@@ -165,10 +217,8 @@ class InferenceSelectionApp:
         self.repair_cases_dir = repair_cases_dir
         self.out_dir = out_dir
         self.tile_size = tile_size
-        self.overlap = overlap
-        self.num_steps = num_steps
         self.root = tk.Tk()
-        self.root.title('mc-terrain-diffusion: regenerate selection')
+        self.root.title('mc-terrain-diffusion: repair selection')
 
         self.dataset = TerrainDiffusionDataset(export_dir, tile_size=tile_size, mask_mode='none')
         height_image, material_image, bounds, height_range = _build_selector_maps(self.dataset)
@@ -209,7 +259,7 @@ class InferenceSelectionApp:
         tk.Label(panel, textvariable=self.selection_var, justify='left', wraplength=360).pack(anchor='w', pady=(12, 0))
         tk.Label(panel, textvariable=self.window_var, justify='left', wraplength=360).pack(anchor='w', pady=(8, 0))
         tk.Label(panel, textvariable=self.status_var, justify='left', wraplength=360).pack(anchor='w', pady=(8, 12))
-        self.run_button = tk.Button(panel, text='Run regeneration', command=self._run_generation)
+        self.run_button = tk.Button(panel, text='Run repair', command=self._run_generation)
         self.run_button.pack(anchor='w')
         self.save_button = tk.Button(panel, text='Save selected case', command=self._save_selected_case)
         self.save_button.pack(anchor='w', pady=(8, 0))
@@ -283,7 +333,7 @@ class InferenceSelectionApp:
                 f'mask px left={self.plan.mask_left} top={self.plan.mask_top} '
                 f'size={self.plan.mask_width}x{self.plan.mask_height}'
             )
-            self.status_var.set('Selection is valid. Click “Run regeneration” to prepare inputs and run inference.')
+            self.status_var.set('Selection is valid. Click “Run repair” to prepare inputs and run U-Net repair.')
         except ValueError as exc:
             self.plan = None
             self.window_var.set(f'Inference window: invalid selection for tile size {self.tile_size}')
@@ -432,26 +482,24 @@ class InferenceSelectionApp:
         self.root.update_idletasks()
         try:
             self._prepare_selection_inputs(self.inputs_dir)
-            self.status_var.set('Running diffusion inference...')
+            self.status_var.set('Running U-Net repair...')
             self.root.update_idletasks()
-            outputs = run_inference_job(
+            outputs = run_repair_job(
                 checkpoint=self.checkpoint,
                 known_height_path=self.inputs_dir / 'known_height.npy',
                 known_material_path=self.inputs_dir / 'known_material.npy',
                 mask_path=self.inputs_dir / 'mask.npy',
                 out_dir=self.out_dir,
-                tile_size=self.tile_size,
-                overlap=self.overlap,
-                num_steps=self.num_steps,
+                known_support_path=self.inputs_dir / 'known_support.npy',
             )
         except Exception as exc:
-            self.status_var.set('Regeneration failed.')
-            self.messagebox.showerror('Inference failed', str(exc))
+            self.status_var.set('Repair failed.')
+            self.messagebox.showerror('Repair failed', str(exc))
         else:
             preview_path = outputs.get('preview_panel', outputs['preview'])
-            self.status_var.set(f'Regeneration complete: {preview_path}')
+            self.status_var.set(f'Repair complete: {preview_path}')
             self._show_preview(preview_path)
-            self.messagebox.showinfo('Done', f'Regeneration finished. Outputs written to {outputs["out_dir"]}.')
+            self.messagebox.showinfo('Done', f'Repair finished. Outputs written to {outputs["out_dir"]}.')
         finally:
             self.run_button.config(state='normal')
 
@@ -460,15 +508,13 @@ class InferenceSelectionApp:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Select a chunk region in a local GUI and run terrain regeneration.')
+    parser = argparse.ArgumentParser(description='Select a chunk region in a local GUI and run U-Net terrain repair.')
     parser.add_argument('--export-dir', required=True)
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--inputs-dir', required=True)
     parser.add_argument('--repair-cases-dir', default='./repair_cases')
     parser.add_argument('--out-dir', required=True)
     parser.add_argument('--tile-size', type=int, default=128)
-    parser.add_argument('--overlap', type=int, default=32)
-    parser.add_argument('--num-steps', type=int, default=None)
     args = parser.parse_args()
 
     app = InferenceSelectionApp(
@@ -478,8 +524,6 @@ def main() -> None:
         repair_cases_dir=Path(args.repair_cases_dir).expanduser().resolve(),
         out_dir=Path(args.out_dir).expanduser().resolve(),
         tile_size=args.tile_size,
-        overlap=args.overlap,
-        num_steps=args.num_steps,
     )
     app.run()
 

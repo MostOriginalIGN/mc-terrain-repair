@@ -16,6 +16,7 @@ from diffusion.repair_training import (
     RepairTrainingState,
     build_repair_checkpoint_meta,
     compute_repair_losses,
+    evaluate_repair_cases,
     load_repair_checkpoint,
     save_repair_checkpoint,
     train_repair_step,
@@ -107,6 +108,14 @@ def test_repair_model_training_and_checkpoint_roundtrip(tmp_path) -> None:
     train_repair_step(model, optimizer, batch)
     assert not torch.allclose(first_param, next(model.parameters()).detach())
 
+    accum_model = TerrainRepairUNet(num_material_classes=dataset.num_material_classes)
+    accum_optimizer = torch.optim.AdamW(accum_model.parameters(), lr=1e-4)
+    accum_first_param = next(accum_model.parameters()).detach().clone()
+    train_repair_step(accum_model, accum_optimizer, batch, loss_scale=2, step_optimizer=False)
+    assert torch.allclose(accum_first_param, next(accum_model.parameters()).detach())
+    train_repair_step(accum_model, accum_optimizer, batch, loss_scale=2, step_optimizer=True, zero_grad=False)
+    assert not torch.allclose(accum_first_param, next(accum_model.parameters()).detach())
+
     checkpoint = tmp_path / "repair.pt"
     args = type("Args", (), {
         "tile_size": 128,
@@ -180,7 +189,15 @@ def test_repair_inference_outputs_and_preserves_known_pixels(tmp_path, monkeypat
 
     saved_case = inputs_dir / "saved_cases" / "case_a"
     saved_case.mkdir(parents=True)
-    for name in ("known_height.npy", "known_material.npy", "known_support.npy", "mask.npy"):
+    for name in (
+        "known_height.npy",
+        "known_material.npy",
+        "known_support.npy",
+        "mask.npy",
+        "target_height.npy",
+        "target_material.npy",
+        "target_support.npy",
+    ):
         (saved_case / name).write_bytes((inputs_dir / name).read_bytes())
     saved_outputs = run_saved_case_jobs(
         checkpoint=checkpoint,
@@ -191,6 +208,12 @@ def test_repair_inference_outputs_and_preserves_known_pixels(tmp_path, monkeypat
     assert saved_outputs[0]["preview_panel"].exists()
     assert saved_outputs[0]["combined_render"].exists()
     assert (tmp_path / "saved_outputs" / "combined_all_cases.png").exists()
+
+    metrics = evaluate_repair_cases(model, inputs_dir / "saved_cases", device=torch.device("cpu"))
+    assert metrics is not None
+    assert metrics.case_count == 1
+    assert np.isfinite(metrics.score)
+    assert 0.0 <= metrics.material_accuracy <= 1.0
 
     argv = [
         "repair_inference",

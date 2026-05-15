@@ -29,7 +29,7 @@ SEA_LEVEL_Y = 64.0
 def _load_array(path_str: str | Path, name: str) -> np.ndarray:
     path = Path(path_str).expanduser().resolve()
     if not path.is_file():
-        raise SystemExit(f"Missing {name} file: {path}. Use `make repair` for shared cases or `make repair-current` after preparing scratch inputs.")
+        raise SystemExit(f"Missing {name} file: {path}. Use `make repair` for shared cases or `make infer` after preparing scratch inputs.")
     return np.load(path)
 
 

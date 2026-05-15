@@ -1,4 +1,4 @@
-"""Diffusion package for surface-oriented Minecraft terrain repair."""
+"""Surface-oriented Minecraft terrain repair package."""
 
 from __future__ import annotations
 
@@ -6,26 +6,18 @@ from importlib import import_module
 from typing import Any
 
 __all__ = [
-    'GaussianDiffusionScheduler',
     'SelectionPlan',
     'TerrainDiffusionDataset',
-    'TerrainDiffusionOutput',
-    'TerrainDiffusionUNet',
     'TerrainRepairDataset',
     'TerrainRepairOutput',
     'TerrainRepairUNet',
     'TerrainWindowSample',
-    'compute_losses',
     'find_origin',
-    'load_checkpoint',
     'load_height_range',
-    'multidiffusion_inpaint',
     'plan_chunk_selection',
     'prepare_inference_inputs',
-    'run_inference_job',
     'run_repair_job',
-    'save_checkpoint',
-    'train_step',
+    'run_saved_case_jobs',
     'train_repair_step',
 ]
 
@@ -38,18 +30,10 @@ _MODULE_EXPORTS = {
     'load_height_range': ('.infer_inputs', 'load_height_range'),
     'plan_chunk_selection': ('.infer_inputs', 'plan_chunk_selection'),
     'prepare_inference_inputs': ('.infer_inputs', 'prepare_inference_inputs'),
-    'multidiffusion_inpaint': ('.inference', 'multidiffusion_inpaint'),
-    'run_inference_job': ('.inference', 'run_inference_job'),
-    'TerrainDiffusionOutput': ('.model', 'TerrainDiffusionOutput'),
-    'TerrainDiffusionUNet': ('.model', 'TerrainDiffusionUNet'),
     'TerrainRepairOutput': ('.repair_model', 'TerrainRepairOutput'),
     'TerrainRepairUNet': ('.repair_model', 'TerrainRepairUNet'),
-    'GaussianDiffusionScheduler': ('.scheduler', 'GaussianDiffusionScheduler'),
     'run_repair_job': ('.repair_inference', 'run_repair_job'),
-    'compute_losses': ('.training', 'compute_losses'),
-    'load_checkpoint': ('.training', 'load_checkpoint'),
-    'save_checkpoint': ('.training', 'save_checkpoint'),
-    'train_step': ('.training', 'train_step'),
+    'run_saved_case_jobs': ('.repair_inference', 'run_saved_case_jobs'),
     'train_repair_step': ('.repair_training', 'train_repair_step'),
 }
 

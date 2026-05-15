@@ -1,4 +1,4 @@
-"""Helpers for building diffusion inference inputs from exported terrain chunks."""
+"""Helpers for building U-Net repair inputs from exported terrain chunks."""
 
 from __future__ import annotations
 

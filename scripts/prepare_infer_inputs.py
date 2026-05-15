@@ -1,4 +1,4 @@
-"""Prepare masked inference inputs from exported terrain arrays."""
+"""Prepare masked U-Net repair inputs from exported terrain arrays."""
 
 from __future__ import annotations
 
@@ -19,10 +19,10 @@ from diffusion.infer_inputs import prepare_inference_inputs  # noqa: E402
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Prepare known_height, known_material, and mask arrays for diffusion inference.')
+    parser = argparse.ArgumentParser(description='Prepare known_height, known_material, known_support, and mask arrays for U-Net repair.')
     parser.add_argument('--export-dir', required=True)
     parser.add_argument('--out-dir', required=True)
-    parser.add_argument('--checkpoint', default=None, help='Optional checkpoint to reuse saved height normalization range')
+    parser.add_argument('--checkpoint', default=None, help='Optional U-Net repair checkpoint to reuse saved height normalization range')
     parser.add_argument('--tile-size', type=int, default=128)
     parser.add_argument('--origin-chunk-x', type=int, default=None)
     parser.add_argument('--origin-chunk-z', type=int, default=None)

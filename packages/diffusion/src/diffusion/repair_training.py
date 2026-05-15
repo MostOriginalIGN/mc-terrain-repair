@@ -8,13 +8,23 @@ import os
 import pickle
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from .repair_data import TerrainRepairDataset
+from exporter.vocab import UNKNOWN_INDEX
+
+from .repair_data import (
+    TerrainRepairDataset,
+    build_prefill_height,
+    compute_boundary_distance,
+    compute_height_gradients,
+    compute_laplacian,
+    estimate_support_from_material,
+)
 from .repair_model import TerrainRepairUNet
 
 
@@ -47,6 +57,16 @@ class RepairLossWeights:
 class RepairAmpConfig:
     enabled: bool
     dtype: torch.dtype | None
+
+
+@dataclass(frozen=True)
+class RepairValidationMetrics:
+    score: float
+    height_mae: float
+    seam_mae: float
+    material_accuracy: float
+    support_mse: float
+    case_count: int
 
 
 def charbonnier(error: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
@@ -143,23 +163,30 @@ def train_repair_step(
     amp_config: RepairAmpConfig = RepairAmpConfig(enabled=False, dtype=None),
     scaler: torch.amp.GradScaler | None = None,
     grad_clip_norm: float | None = None,
+    loss_scale: float = 1.0,
+    step_optimizer: bool = True,
+    zero_grad: bool = True,
 ) -> RepairLossOutput:
-    optimizer.zero_grad(set_to_none=True)
+    if zero_grad:
+        optimizer.zero_grad(set_to_none=True)
     device_type = next(model.parameters()).device.type
     with torch.autocast(device_type=device_type, dtype=amp_config.dtype, enabled=amp_config.enabled):
         losses = compute_repair_losses(model, batch, weights=weights)
+        backward_loss = losses.total_loss / max(loss_scale, 1.0)
     if scaler is not None and scaler.is_enabled():
-        scaler.scale(losses.total_loss).backward()
-        if grad_clip_norm is not None and grad_clip_norm > 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-        scaler.step(optimizer)
-        scaler.update()
+        scaler.scale(backward_loss).backward()
+        if step_optimizer:
+            if grad_clip_norm is not None and grad_clip_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            scaler.step(optimizer)
+            scaler.update()
     else:
-        losses.total_loss.backward()
-        if grad_clip_norm is not None and grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-        optimizer.step()
+        backward_loss.backward()
+        if step_optimizer:
+            if grad_clip_norm is not None and grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            optimizer.step()
     return losses
 
 
@@ -196,12 +223,41 @@ def move_repair_batch(
     return moved
 
 
-def select_training_device() -> torch.device:
+def select_training_device(requested: str = "auto") -> torch.device:
+    if requested != "auto":
+        device = torch.device(requested)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("Requested --device cuda, but CUDA is not available.")
+        if device.type == "mps" and (getattr(torch.backends, "mps", None) is None or not torch.backends.mps.is_available()):
+            raise RuntimeError("Requested --device mps, but MPS is not available.")
+        return device
     if torch.cuda.is_available():
         return torch.device("cuda")
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def configure_cuda_backend(device: torch.device, tf32: str, cudnn_benchmark: bool) -> None:
+    if device.type != "cuda":
+        return
+    allow_tf32 = tf32 == "on" or tf32 == "auto"
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    torch.backends.cudnn.allow_tf32 = allow_tf32
+    torch.backends.cudnn.benchmark = cudnn_benchmark
+
+
+def create_summary_writer(log_dir: str | None):
+    if log_dir is None:
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        print("TensorBoard is not installed; continuing without TensorBoard logging.")
+        return None
+    path = Path(log_dir).expanduser().resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return SummaryWriter(log_dir=str(path))
 
 
 def save_repair_checkpoint(
@@ -237,13 +293,13 @@ def load_repair_checkpoint(
             f"Could not load repair checkpoint at {path.expanduser().resolve()}. "
             "The file is missing, incomplete, or not a valid PyTorch repair checkpoint. "
             "If training is still running, wait for it to finish saving; otherwise rerun "
-            "`make train-repair` to create a fresh checkpoint."
+            "`make train` to create a fresh checkpoint."
         ) from exc
     if not isinstance(checkpoint, dict) or "model_state" not in checkpoint:
         raise RuntimeError(
             f"Could not load repair checkpoint at {path.expanduser().resolve()}. "
             "This file does not look like a deterministic repair checkpoint. "
-            "Use `make train-repair` to create artifacts/repair.pt before running `make repair`."
+            "Use `make train` to create artifacts/repair.pt before running `make repair`."
         )
     model.load_state_dict(checkpoint["model_state"])
     if optimizer is not None and checkpoint.get("optimizer_state") is not None:
@@ -281,6 +337,7 @@ def build_repair_checkpoint_meta(
         "amp": getattr(args, "amp", None),
         "channels_last": getattr(args, "channels_last", None),
         "compile": getattr(args, "compile", None),
+        "best_score": getattr(args, "best_score", None),
     }
 
 
@@ -301,18 +358,171 @@ def persist_repair_checkpoint(
     )
 
 
+def persist_repair_checkpoints(
+    checkpoint_path: str | Path,
+    model: TerrainRepairUNet,
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+    dataset: TerrainRepairDataset,
+    state: RepairTrainingState,
+    interrupted: bool,
+    latest_checkpoint_path: str | Path | None = None,
+) -> None:
+    persist_repair_checkpoint(checkpoint_path, model, optimizer, args, dataset, state, interrupted=interrupted)
+    if latest_checkpoint_path is not None and Path(latest_checkpoint_path) != Path(checkpoint_path):
+        persist_repair_checkpoint(latest_checkpoint_path, model, optimizer, args, dataset, state, interrupted=interrupted)
+
+
+def checkpoint_sibling(path: str | Path, suffix: str) -> Path:
+    checkpoint_path = Path(path)
+    return checkpoint_path.with_name(f"{checkpoint_path.stem}_{suffix}{checkpoint_path.suffix}")
+
+
+def _load_case_tensor(path: Path, dtype: np.dtype | type[np.generic]) -> np.ndarray:
+    return np.load(path).astype(dtype)
+
+
+def _build_validation_batch(case_dir: Path, device: torch.device, channels_last: bool) -> dict[str, torch.Tensor] | None:
+    required = [
+        case_dir / "known_height.npy",
+        case_dir / "known_material.npy",
+        case_dir / "mask.npy",
+        case_dir / "target_height.npy",
+        case_dir / "target_material.npy",
+    ]
+    if not all(path.is_file() for path in required):
+        return None
+
+    known_height = _load_case_tensor(case_dir / "known_height.npy", np.float32)
+    known_material = _load_case_tensor(case_dir / "known_material.npy", np.int64)
+    mask = _load_case_tensor(case_dir / "mask.npy", np.float32)
+    target_height = _load_case_tensor(case_dir / "target_height.npy", np.float32)
+    target_material = _load_case_tensor(case_dir / "target_material.npy", np.int64)
+    target_support_path = case_dir / "target_support.npy"
+    known_support_path = case_dir / "known_support.npy"
+    target_support = (
+        _load_case_tensor(target_support_path, np.float32)
+        if target_support_path.is_file()
+        else estimate_support_from_material(target_material)
+    )
+    known_support = (
+        _load_case_tensor(known_support_path, np.float32)
+        if known_support_path.is_file()
+        else target_support * (1.0 - mask)
+    )
+
+    known_material = known_material.copy()
+    known_material[mask.astype(bool)] = UNKNOWN_INDEX
+    prefill_height = build_prefill_height(known_height, mask)
+    batch = {
+        "known_height": torch.from_numpy(known_height[None, None, ...]),
+        "known_material": torch.from_numpy(known_material[None, ...]),
+        "known_support": torch.from_numpy(known_support[None, None, ...]),
+        "mask": torch.from_numpy(mask[None, None, ...]),
+        "prefill_height": torch.from_numpy(prefill_height[None, None, ...]),
+        "boundary_distance": torch.from_numpy(compute_boundary_distance(mask)[None, None, ...]),
+        "prefill_gradients": torch.from_numpy(compute_height_gradients(prefill_height)[None, ...]),
+        "prefill_laplacian": torch.from_numpy(compute_laplacian(prefill_height)[None, None, ...]),
+        "target_height": torch.from_numpy(target_height[None, None, ...]),
+        "target_material": torch.from_numpy(target_material[None, ...]),
+        "target_support": torch.from_numpy(target_support[None, None, ...]),
+    }
+    return move_repair_batch(batch, device, channels_last=channels_last)
+
+
+def evaluate_repair_cases(
+    model: torch.nn.Module,
+    cases_dir: str | Path,
+    device: torch.device,
+    amp_config: RepairAmpConfig = RepairAmpConfig(enabled=False, dtype=None),
+    channels_last: bool = False,
+) -> RepairValidationMetrics | None:
+    root = Path(cases_dir).expanduser().resolve()
+    if not root.is_dir():
+        return None
+
+    totals = {
+        "height_mae": 0.0,
+        "seam_mae": 0.0,
+        "material_accuracy": 0.0,
+        "support_mse": 0.0,
+    }
+    case_count = 0
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for case_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+            batch = _build_validation_batch(case_dir, device, channels_last=channels_last)
+            if batch is None:
+                continue
+            with torch.autocast(device_type=device.type, dtype=amp_config.dtype, enabled=amp_config.enabled):
+                outputs = model(
+                    known_height=batch["known_height"],
+                    prefill_height=batch["prefill_height"],
+                    mask=batch["mask"],
+                    known_material=batch["known_material"],
+                    known_support=batch["known_support"],
+                    boundary_distance=batch["boundary_distance"],
+                    prefill_gradients=batch["prefill_gradients"],
+                    prefill_laplacian=batch["prefill_laplacian"],
+                )
+                predicted_height = batch["prefill_height"] + outputs.height_residual
+                composite_height = batch["target_height"] * (1.0 - batch["mask"]) + predicted_height * batch["mask"]
+                height_mae = masked_mean((composite_height - batch["target_height"]).abs(), batch["mask"])
+
+                pred_grad_x, pred_grad_y = height_gradients(composite_height)
+                target_grad_x, target_grad_y = height_gradients(batch["target_height"])
+                seam_mask = boundary_band(batch["mask"])
+                seam_mae = masked_mean((pred_grad_x - target_grad_x).abs() + (pred_grad_y - target_grad_y).abs(), seam_mask)
+
+                pred_material = outputs.material_logits.argmax(dim=1)
+                material_mask = batch["mask"].squeeze(1).bool()
+                material_accuracy = (pred_material[material_mask] == batch["target_material"][material_mask]).float().mean()
+                support_mse = masked_mean((outputs.support - batch["target_support"]) ** 2, batch["mask"])
+
+            totals["height_mae"] += float(height_mae.detach().cpu())
+            totals["seam_mae"] += float(seam_mae.detach().cpu())
+            totals["material_accuracy"] += float(material_accuracy.detach().cpu())
+            totals["support_mse"] += float(support_mse.detach().cpu())
+            case_count += 1
+
+    if was_training:
+        model.train()
+    if case_count == 0:
+        return None
+    averaged = {key: value / case_count for key, value in totals.items()}
+    score = (
+        averaged["height_mae"]
+        + 0.5 * averaged["seam_mae"]
+        + 0.2 * (1.0 - averaged["material_accuracy"])
+        + 0.1 * averaged["support_mse"]
+    )
+    return RepairValidationMetrics(
+        score=score,
+        height_mae=averaged["height_mae"],
+        seam_mae=averaged["seam_mae"],
+        material_accuracy=averaged["material_accuracy"],
+        support_mse=averaged["support_mse"],
+        case_count=case_count,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train deterministic surface terrain repair.")
     parser.add_argument("--export-dir", required=True, help="Directory containing exported chunk and surface arrays")
     parser.add_argument("--checkpoint", required=True, help="Output checkpoint path")
+    parser.add_argument("--latest-checkpoint", default=None, help="Optional latest-checkpoint path; defaults beside --checkpoint")
+    parser.add_argument("--best-checkpoint", default=None, help="Optional best-checkpoint path; defaults beside --checkpoint")
     parser.add_argument("--resume", default=None, help="Optional checkpoint to resume from")
     parser.add_argument("--epochs", type=int, default=1, help="Total target epoch count, including resumed epochs")
     parser.add_argument("--save-every", type=int, default=1, help="Save a checkpoint every N epochs")
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--tile-size", type=int, default=128)
     parser.add_argument("--stride-chunks", type=int, default=1)
     parser.add_argument("--mask-mode", default="terrain_mixed", choices=["none", "rectangle", "strip", "blob", "mixed", "terrain_mixed"])
+    parser.add_argument("--device", default="auto", help="Training device: auto, cuda, cuda:0, mps, or cpu")
     parser.add_argument("--amp", default="auto", choices=["auto", "off", "fp16", "bf16"], help="Mixed precision mode; auto enables CUDA AMP.")
     parser.add_argument("--compile", action="store_true", help="Use torch.compile for the training model when available.")
     parser.add_argument("--compile-mode", default="default", choices=["default", "reduce-overhead", "max-autotune"])
@@ -320,11 +530,20 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers for feature preparation.")
     parser.add_argument("--grad-clip-norm", type=float, default=1.0, help="Clip gradient norm; set <= 0 to disable.")
     parser.add_argument("--matmul-precision", default="high", choices=["highest", "high", "medium"])
+    parser.add_argument("--tf32", default="auto", choices=["auto", "on", "off"], help="Allow TF32 matmul/cudnn on CUDA.")
+    parser.add_argument("--cudnn-benchmark", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--validation-cases-dir", default=None, help="Directory of fixed repair cases for epoch validation.")
+    parser.add_argument("--validate-every", type=int, default=1, help="Validate every N epochs when validation cases are configured.")
+    parser.add_argument("--tensorboard-dir", default=None, help="Write TensorBoard logs to this directory.")
     args = parser.parse_args()
 
-    device = select_training_device()
+    device = select_training_device(args.device)
+    configure_cuda_backend(device, args.tf32, args.cudnn_benchmark)
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision(args.matmul_precision)
+    latest_checkpoint = Path(args.latest_checkpoint) if args.latest_checkpoint else checkpoint_sibling(args.checkpoint, "latest")
+    best_checkpoint = Path(args.best_checkpoint) if args.best_checkpoint else checkpoint_sibling(args.checkpoint, "best")
+    writer = create_summary_writer(args.tensorboard_dir)
     dataset = TerrainRepairDataset(
         args.export_dir,
         tile_size=args.tile_size,
@@ -349,11 +568,15 @@ def main() -> None:
     amp_config = resolve_amp_config(device, args.amp)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_config.enabled and amp_config.dtype == torch.float16 and device.type == "cuda")
     train_model: TerrainRepairUNet | torch.nn.Module = model
+    best_score = float("inf")
 
     state = RepairTrainingState()
     if args.resume is not None:
         payload = load_repair_checkpoint(args.resume, model, optimizer=optimizer, map_location=device)
         state = restore_repair_training_state(payload)
+        meta = payload.get("meta")
+        if isinstance(meta, dict) and isinstance(meta.get("best_score"), (int, float)):
+            best_score = float(meta["best_score"])
         print(
             f"Resumed repair model from {Path(args.resume).resolve()} at epoch "
             f"{state.completed_epochs} step {state.global_step}"
@@ -377,6 +600,7 @@ def main() -> None:
         print(f"Using AMP dtype={amp_config.dtype}")
     if args.channels_last:
         print("Using channels-last memory format")
+    print(f"Training on {device}; grad_accum_steps={max(1, args.grad_accum_steps)}")
 
     model.train()
     progress: tqdm | None = None
@@ -385,7 +609,13 @@ def main() -> None:
             dataset.set_mask_epoch(epoch)
             losses: RepairLossOutput | None = None
             progress = tqdm(loader, desc=f"Repair Epoch {epoch + 1}/{args.epochs}", unit="batch", dynamic_ncols=True)
-            for batch in progress:
+            total_batches = len(loader)
+            accum_steps = max(1, args.grad_accum_steps)
+            for batch_index, batch in enumerate(progress):
+                window_start = (batch_index // accum_steps) * accum_steps
+                window_end = min(window_start + accum_steps, total_batches)
+                window_size = window_end - window_start
+                should_step = batch_index + 1 == window_end
                 batch = move_repair_batch(batch, device, channels_last=args.channels_last)
                 losses = train_repair_step(
                     train_model,
@@ -395,8 +625,19 @@ def main() -> None:
                     amp_config=amp_config,
                     scaler=scaler,
                     grad_clip_norm=args.grad_clip_norm,
+                    loss_scale=window_size,
+                    step_optimizer=should_step,
+                    zero_grad=batch_index == window_start,
                 )
-                state = RepairTrainingState(completed_epochs=epoch, global_step=state.global_step + 1)
+                if should_step:
+                    state = RepairTrainingState(completed_epochs=epoch, global_step=state.global_step + 1)
+                    if writer is not None and losses is not None:
+                        writer.add_scalar("train/total_loss", losses.total_loss.item(), state.global_step)
+                        writer.add_scalar("train/height_loss", losses.height_loss.item(), state.global_step)
+                        writer.add_scalar("train/gradient_loss", losses.gradient_loss.item(), state.global_step)
+                        writer.add_scalar("train/seam_loss", losses.seam_loss.item(), state.global_step)
+                        writer.add_scalar("train/material_loss", losses.material_loss.item(), state.global_step)
+                        writer.add_scalar("train/support_loss", losses.support_loss.item(), state.global_step)
                 progress.set_postfix({
                     "total": f"{losses.total_loss.item():.4f}",
                     "height": f"{losses.height_loss.item():.4f}",
@@ -414,19 +655,53 @@ def main() -> None:
                     f"seam={losses.seam_loss.item():.4f} material={losses.material_loss.item():.4f} "
                     f"support={losses.support_loss.item():.4f}"
                 )
+            validation_metrics = None
+            if args.validation_cases_dir is not None and args.validate_every > 0 and ((epoch + 1) % args.validate_every == 0 or epoch + 1 == args.epochs):
+                validation_metrics = evaluate_repair_cases(
+                    model,
+                    args.validation_cases_dir,
+                    device=device,
+                    amp_config=amp_config,
+                    channels_last=args.channels_last,
+                )
+                if validation_metrics is not None:
+                    print(
+                        f"repair validation: score={validation_metrics.score:.4f} "
+                        f"height_mae={validation_metrics.height_mae:.4f} seam_mae={validation_metrics.seam_mae:.4f} "
+                        f"material_acc={validation_metrics.material_accuracy:.4f} support_mse={validation_metrics.support_mse:.4f} "
+                        f"cases={validation_metrics.case_count}"
+                    )
+                    if writer is not None:
+                        writer.add_scalar("val/score", validation_metrics.score, state.global_step)
+                        writer.add_scalar("val/height_mae", validation_metrics.height_mae, state.global_step)
+                        writer.add_scalar("val/seam_mae", validation_metrics.seam_mae, state.global_step)
+                        writer.add_scalar("val/material_accuracy", validation_metrics.material_accuracy, state.global_step)
+                        writer.add_scalar("val/support_mse", validation_metrics.support_mse, state.global_step)
+                    if validation_metrics.score < best_score:
+                        best_score = validation_metrics.score
+                        best_args = argparse.Namespace(**vars(args), best_score=best_score)
+                        persist_repair_checkpoint(best_checkpoint, model, optimizer, best_args, dataset, state, interrupted=False)
+                        print(f"Saved best repair checkpoint to {best_checkpoint.resolve()}")
             if args.save_every > 0 and ((epoch + 1) % args.save_every == 0 or epoch + 1 == args.epochs):
-                persist_repair_checkpoint(args.checkpoint, model, optimizer, args, dataset, state, interrupted=False)
+                latest_args = argparse.Namespace(**vars(args), best_score=best_score if best_score < float("inf") else None)
+                persist_repair_checkpoints(args.checkpoint, model, optimizer, latest_args, dataset, state, interrupted=False, latest_checkpoint_path=latest_checkpoint)
                 print(f"Saved repair checkpoint to {Path(args.checkpoint).resolve()}")
     except KeyboardInterrupt:
         if progress is not None:
             progress.close()
-        persist_repair_checkpoint(args.checkpoint, model, optimizer, args, dataset, state, interrupted=True)
+        latest_args = argparse.Namespace(**vars(args), best_score=best_score if best_score < float("inf") else None)
+        persist_repair_checkpoints(args.checkpoint, model, optimizer, latest_args, dataset, state, interrupted=True, latest_checkpoint_path=latest_checkpoint)
         print(f"Interrupted. Saved repair checkpoint to {Path(args.checkpoint).resolve()}")
+        if writer is not None:
+            writer.close()
         return
 
     if args.save_every <= 0:
-        persist_repair_checkpoint(args.checkpoint, model, optimizer, args, dataset, state, interrupted=False)
+        latest_args = argparse.Namespace(**vars(args), best_score=best_score if best_score < float("inf") else None)
+        persist_repair_checkpoints(args.checkpoint, model, optimizer, latest_args, dataset, state, interrupted=False, latest_checkpoint_path=latest_checkpoint)
         print(f"Saved repair checkpoint to {Path(args.checkpoint).resolve()}")
+    if writer is not None:
+        writer.close()
 
 
 if __name__ == "__main__":
