@@ -351,8 +351,8 @@ def main() -> None:
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--tile-size", type=int, default=128)
     parser.add_argument("--stride-chunks", type=int, default=1)
-    parser.add_argument("--mask-mode", default="terrain_mixed",
-                        choices=["none", "rectangle", "strip", "blob", "mixed", "terrain_mixed"])
+    parser.add_argument("--mask-mode", default="selection_mixed",
+                        choices=["none", "rectangle", "strip", "blob", "mixed", "terrain_mixed", "selection_mixed"])
 
     parser.add_argument("--amp", default="auto", choices=["auto", "off", "fp16", "bf16"])
     parser.add_argument("--precision", default=None,

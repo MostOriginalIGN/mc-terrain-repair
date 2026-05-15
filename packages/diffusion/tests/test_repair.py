@@ -84,6 +84,15 @@ def test_repair_dataset_features_and_unknown_material(tmp_path) -> None:
     assert epoch_one_mask.sum().item() > 0
     assert not torch.equal(epoch_zero_mask, epoch_one_mask)
 
+    selection_dataset = TerrainRepairDataset(export_dir, tile_size=128, mask_mode="selection_mixed", seed=13, cache_arrays=False)
+    selection_mask = selection_dataset[0]["mask"]
+    selection_dataset.set_mask_epoch(1)
+    next_selection_mask = selection_dataset[0]["mask"]
+    assert selection_mask.shape == (1, 128, 128)
+    assert 0 < selection_mask.sum().item() < 128 * 128
+    assert next_selection_mask.sum().item() > 0
+    assert not torch.equal(selection_mask, next_selection_mask)
+
 
 def test_repair_dataset_keeps_multi_export_windows_separate(tmp_path) -> None:
     export_a = tmp_path / "export_a"

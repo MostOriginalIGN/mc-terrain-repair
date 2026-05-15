@@ -245,6 +245,8 @@ class TerrainRepairDataset(TerrainDiffusionDataset):
             return self._build_blob_mask(index)
         if self.mask_mode == "terrain_mixed":
             return self._build_terrain_mixed_mask(index, target_height=target_height, materials=materials, support=support)
+        if self.mask_mode == "selection_mixed":
+            return self._build_selection_mixed_mask(index, target_height=target_height, materials=materials, support=support)
         raise ValueError(f"Unsupported mask_mode: {self.mask_mode}")
 
     def _build_rectangle_mask(
@@ -319,6 +321,118 @@ class TerrainRepairDataset(TerrainDiffusionDataset):
         if not mask.any():
             mask[self.tile_size // 2, self.tile_size // 2] = True
         return mask.astype(np.float32)
+
+    def _build_chunk_rectangle_mask(
+        self,
+        rng: np.random.Generator,
+        center: tuple[int, int] | None = None,
+        max_chunks: int = 4,
+    ) -> np.ndarray:
+        max_side_chunks = max(1, min(max_chunks, self.chunks_per_side))
+        side_choices = np.arange(1, max_side_chunks + 1)
+        weights = np.array([0.36, 0.30, 0.22, 0.12][:max_side_chunks], dtype=np.float64)
+        if weights.size < side_choices.size:
+            weights = np.pad(weights, (0, side_choices.size - weights.size), constant_values=0.06)
+        weights /= weights.sum()
+
+        height_chunks = int(rng.choice(side_choices, p=weights))
+        width_chunks = int(rng.choice(side_choices, p=weights))
+        if float(rng.random()) < 0.20 and max_side_chunks >= 4:
+            if bool(rng.integers(0, 2)):
+                height_chunks, width_chunks = 2, min(4, max_side_chunks)
+            else:
+                height_chunks, width_chunks = min(4, max_side_chunks), 2
+
+        height = height_chunks * CHUNK_SIZE
+        width = width_chunks * CHUNK_SIZE
+        max_top_chunk = self.chunks_per_side - height_chunks
+        max_left_chunk = self.chunks_per_side - width_chunks
+        if center is None:
+            top_chunk = int(rng.integers(0, max_top_chunk + 1))
+            left_chunk = int(rng.integers(0, max_left_chunk + 1))
+        else:
+            cy, cx = center
+            top_chunk = int(np.clip(round((cy - height / 2) / CHUNK_SIZE), 0, max_top_chunk))
+            left_chunk = int(np.clip(round((cx - width / 2) / CHUNK_SIZE), 0, max_left_chunk))
+
+        top = top_chunk * CHUNK_SIZE
+        left = left_chunk * CHUNK_SIZE
+        mask = np.zeros((self.tile_size, self.tile_size), dtype=np.float32)
+        mask[top:top + height, left:left + width] = 1.0
+        return mask
+
+    def _build_compact_blob_mask(
+        self,
+        rng: np.random.Generator,
+        center: tuple[int, int] | None = None,
+    ) -> np.ndarray:
+        yy, xx = np.mgrid[0:self.tile_size, 0:self.tile_size]
+        mask = np.zeros((self.tile_size, self.tile_size), dtype=bool)
+        blob_count = int(rng.integers(1, 4))
+        base_radius = int(rng.integers(max(8, self.tile_size // 12), max(12, self.tile_size // 4) + 1))
+        if center is None:
+            cy = int(rng.integers(base_radius, max(base_radius + 1, self.tile_size - base_radius)))
+            cx = int(rng.integers(base_radius, max(base_radius + 1, self.tile_size - base_radius)))
+        else:
+            cy, cx = center
+        for _ in range(blob_count):
+            local_radius = max(6, int(base_radius * float(rng.uniform(0.55, 1.05))))
+            oy = int(rng.integers(-base_radius, base_radius + 1))
+            ox = int(rng.integers(-base_radius, base_radius + 1))
+            by = float(np.clip(cy + oy, 0, self.tile_size - 1))
+            bx = float(np.clip(cx + ox, 0, self.tile_size - 1))
+            ry = float(rng.integers(max(5, local_radius // 2), local_radius + 1))
+            rx = float(rng.integers(max(5, local_radius // 2), local_radius + 1))
+            mask |= (((yy - by) / ry) ** 2 + ((xx - bx) / rx) ** 2) <= 1.0
+        return mask.astype(np.float32)
+
+    def _build_small_hole_mask(self, rng: np.random.Generator) -> np.ndarray:
+        size_choices = np.array([8, 12, 16, 24], dtype=np.int64)
+        valid_sizes = size_choices[size_choices <= self.tile_size]
+        size = int(rng.choice(valid_sizes if valid_sizes.size else np.array([max(4, self.tile_size // 8)])))
+        height = size
+        width = size if float(rng.random()) < 0.65 else int(min(self.tile_size, size * rng.choice([2, 3])))
+        top = int(rng.integers(0, self.tile_size - height + 1))
+        left = int(rng.integers(0, self.tile_size - width + 1))
+        mask = np.zeros((self.tile_size, self.tile_size), dtype=np.float32)
+        mask[top:top + height, left:left + width] = 1.0
+        return mask
+
+    def _build_border_strip_mask(self, rng: np.random.Generator) -> np.ndarray:
+        mask = self._build_strip_mask(0, rng=rng, scale=0.8)
+        if float(rng.random()) < 0.35:
+            width = int(rng.integers(CHUNK_SIZE, min(self.tile_size, CHUNK_SIZE * 3) + 1))
+            if bool(rng.integers(0, 2)):
+                mask[:width, :] = 1.0
+                mask[:, :width] = 1.0
+            else:
+                mask[-width:, :] = 1.0
+                mask[:, -width:] = 1.0
+        return mask.astype(np.float32)
+
+    def _build_selection_mixed_mask(
+        self,
+        index: int,
+        target_height: np.ndarray | None,
+        materials: np.ndarray | None,
+        support: np.ndarray | None,
+    ) -> np.ndarray:
+        rng = self._rng(index)
+        bucket = float(rng.random())
+        if bucket < 0.45:
+            return self._build_chunk_rectangle_mask(rng)
+        if bucket < 0.65:
+            return self._build_compact_blob_mask(rng)
+        if bucket < 0.80:
+            return self._build_border_strip_mask(rng)
+        if bucket < 0.90 and target_height is not None:
+            center = self._sample_hard_terrain_center(rng, target_height, materials=materials, support=support)
+            if float(rng.random()) < 0.70:
+                return self._build_chunk_rectangle_mask(rng, center=center)
+            return self._build_compact_blob_mask(rng, center=center)
+        if bucket < 0.95:
+            return self._build_small_hole_mask(rng)
+        return self._build_stress_mask(index, rng=rng)
 
     def _build_terrain_mixed_mask(
         self,

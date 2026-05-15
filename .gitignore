@@ -9,6 +9,5 @@ build/
 artifacts/
 outputs/
 inputs/
-data/chunks/*
-!data/chunks/.gitkeep
+data/
 .DS_Store

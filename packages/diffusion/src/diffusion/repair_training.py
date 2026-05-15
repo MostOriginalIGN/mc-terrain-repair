@@ -561,7 +561,11 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--tile-size", type=int, default=128)
     parser.add_argument("--stride-chunks", type=int, default=1)
-    parser.add_argument("--mask-mode", default="terrain_mixed", choices=["none", "rectangle", "strip", "blob", "mixed", "terrain_mixed"])
+    parser.add_argument(
+        "--mask-mode",
+        default="selection_mixed",
+        choices=["none", "rectangle", "strip", "blob", "mixed", "terrain_mixed", "selection_mixed"],
+    )
     parser.add_argument("--device", default="auto", help="Training device: auto, cuda, cuda:0, mps, or cpu")
     parser.add_argument("--amp", default="auto", choices=["auto", "off", "fp16", "bf16"], help="Mixed precision mode; auto enables CUDA AMP.")
     parser.add_argument("--compile", action="store_true", help="Use torch.compile for the training model when available.")
