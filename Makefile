@@ -11,6 +11,7 @@ KNOWN_HEIGHT ?= $(INPUTS)/known_height.npy
 KNOWN_MATERIAL ?= $(INPUTS)/known_material.npy
 MASK ?= $(INPUTS)/mask.npy
 OUTPUTS ?= ./outputs
+SAVED_CASES ?= $(OUTPUTS)/saved_cases
 REPAIR_CASES ?= ./repair_cases
 CASE ?=
 SAMPLE_COUNT ?= 5
@@ -33,7 +34,7 @@ MASK_LEFT ?= 48
 MASK_HEIGHT ?= 32
 MASK_WIDTH ?= 32
 
-.PHONY: help sync test export visualize train train-repair prepare-infer infer repair repair-current repair-case infer-gui
+.PHONY: help sync test export visualize train train-repair prepare-infer infer repair repair-current repair-case infer-gui view-repair
 
 help:
 	@printf "Targets:\n"
@@ -49,6 +50,7 @@ help:
 	@printf "  make repair-current [INPUTS=...]                Run deterministic repair on prepared scratch inputs\n"
 	@printf "  make repair-case CASE=name                     Run deterministic repair on REPAIR_CASES/name\n"
 	@printf "  make infer-gui [CHECKPOINT=...]                Pick a chunk region in a local GUI and run regeneration\n"
+	@printf "  make view-repair [SAVED_CASES=...]             Open 3D repair output viewer (pygame)\n"
 
 sync:
 	uv sync --all-packages --all-extras
@@ -85,3 +87,6 @@ repair-case:
 
 infer-gui:
 	uv run --package mc-terrain-diffusion python scripts/infer_gui.py --export-dir "$(OUT)" --checkpoint "$(CHECKPOINT)" --inputs-dir "$(INPUTS)" --repair-cases-dir "$(REPAIR_CASES)" --out-dir "$(OUTPUTS)" --tile-size $(INFER_TILE_SIZE) --overlap $(OVERLAP) $(if $(NUM_STEPS),--num-steps $(NUM_STEPS),)
+
+view-repair:
+	uv run --package mc-terrain-render repair-3d --cases-dir "$(SAVED_CASES)" --repair-cases-dir "$(REPAIR_CASES)"

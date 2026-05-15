@@ -157,6 +157,7 @@ def test_repair_inference_outputs_and_preserves_known_pixels(tmp_path, monkeypat
     assert outputs["height"].exists()
     assert outputs["material"].exists()
     assert outputs["support"].exists()
+    assert outputs["mask"].exists()
     assert outputs["preview"].exists()
     assert outputs["material_preview"].exists()
     assert outputs["support_preview"].exists()

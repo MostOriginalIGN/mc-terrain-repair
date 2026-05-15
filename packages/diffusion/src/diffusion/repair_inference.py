@@ -379,6 +379,7 @@ def run_repair_job(
     np.save(output_dir / "height.npy", normalized_height)
     np.save(output_dir / "material.npy", material)
     np.save(output_dir / "support.npy", support)
+    np.save(output_dir / "mask.npy", mask_array)
 
     world_height = _maybe_denormalize(normalized_height, checkpoint_payload)
     preview_height = world_height if world_height is not None else normalized_height
@@ -411,6 +412,7 @@ def run_repair_job(
         "height": output_dir / "height.npy",
         "material": output_dir / "material.npy",
         "support": output_dir / "support.npy",
+        "mask": output_dir / "mask.npy",
         "preview": output_dir / "height_preview.png",
         "material_preview": output_dir / "material_preview.png",
         "support_preview": output_dir / "support_preview.png",
