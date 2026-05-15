@@ -11,3 +11,4 @@ outputs/
 inputs/
 data/chunks/*
 !data/chunks/.gitkeep
+.DS_Store
