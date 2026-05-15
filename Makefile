@@ -23,12 +23,13 @@ EXPORT_SEED ?=
 EPOCHS ?= 1
 BATCH_SIZE ?= 2
 LEARNING_RATE ?= 1e-4
+LR_SCHEDULER ?= none
 TRAIN_TILE_SIZE ?= 128
 STRIDE_CHUNKS ?= 1
 REPAIR_MASK_MODE ?= terrain_mixed
 AMP ?= auto
 DEVICE ?= auto
-NUM_WORKERS ?= -1
+NUM_WORKERS ?= 0
 GRAD_CLIP_NORM ?= 1.0
 GRAD_ACCUM_STEPS ?= 1
 VALIDATE_EVERY ?= 1
@@ -43,6 +44,9 @@ LIGHTNING_STRATEGY ?= auto
 LIGHTNING_PRECISION ?=
 LIGHTNING_ROOT ?= ./artifacts/lightning
 LIGHTNING_CKPT ?=
+LIGHTNING_NUM_WORKERS ?= -1
+LIGHTNING_PREFETCH_FACTOR ?= 4
+PREFILL_ITERATIONS ?= 64
 LITLOGGER_NAME ?=
 LITLOGGER_TEAMSPACE ?=
 LITLOGGER_ROOT ?=
@@ -99,6 +103,7 @@ train:
 		--batch-size $(BATCH_SIZE) \
 		--grad-accum-steps $(GRAD_ACCUM_STEPS) \
 		--learning-rate $(LEARNING_RATE) \
+		--lr-scheduler "$(LR_SCHEDULER)" \
 		--tile-size $(TRAIN_TILE_SIZE) \
 		--stride-chunks $(STRIDE_CHUNKS) \
 		--mask-mode "$(REPAIR_MASK_MODE)" \
@@ -106,7 +111,9 @@ train:
 		--accelerator "$(LIGHTNING_ACCELERATOR)" \
 		--devices "$(LIGHTNING_DEVICES)" \
 		--strategy "$(LIGHTNING_STRATEGY)" \
-		--num-workers $(NUM_WORKERS) \
+		--num-workers $(LIGHTNING_NUM_WORKERS) \
+		--prefetch-factor $(LIGHTNING_PREFETCH_FACTOR) \
+		--prefill-iterations $(PREFILL_ITERATIONS) \
 		--grad-clip-norm $(GRAD_CLIP_NORM) \
 		--validation-cases-dir "$(REPAIR_CASES)" \
 		--validate-every $(VALIDATE_EVERY) \

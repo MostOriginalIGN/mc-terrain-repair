@@ -26,12 +26,6 @@ from torch import Tensor
 from torch.nn import Module
 from torch.utils.data import DataLoader
 
-warnings.filterwarnings(
-    "ignore",
-    message=r"`isinstance\(treespec, LeafSpec\)` is deprecated.*",
-    category=FutureWarning,
-)
-
 from diffusion.repair_data import TerrainRepairDataset
 from diffusion.repair_model import TerrainRepairUNet
 from diffusion.repair_training import (
@@ -45,6 +39,12 @@ from diffusion.repair_training import (
     load_repair_checkpoint,
     resolve_training_export_dirs,
     save_repair_checkpoint,
+)
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"`isinstance\(treespec, LeafSpec\)` is deprecated.*",
+    category=FutureWarning,
 )
 
 
@@ -94,6 +94,7 @@ class TerrainRepairLightningModule(pl.LightningModule):
         self,
         num_material_classes: int,
         learning_rate: float = 1e-4,
+        lr_scheduler: str = "none",
         channels_last: bool = False,
         weights: RepairLossWeights = RepairLossWeights(),
     ):
@@ -101,6 +102,7 @@ class TerrainRepairLightningModule(pl.LightningModule):
         self.save_hyperparameters({
             "num_material_classes": num_material_classes,
             "learning_rate": learning_rate,
+            "lr_scheduler": lr_scheduler,
             "channels_last": channels_last,
             "loss_weights": {
                 "height": weights.height,
@@ -112,6 +114,7 @@ class TerrainRepairLightningModule(pl.LightningModule):
         })
         self.model = TerrainRepairUNet(num_material_classes=num_material_classes)
         self.learning_rate = learning_rate
+        self.lr_scheduler = lr_scheduler
         self.channels_last = channels_last
         self.weights = weights
         if channels_last:
@@ -143,19 +146,25 @@ class TerrainRepairLightningModule(pl.LightningModule):
         batch = _format_repair_batch(batch, self.channels_last)
         losses = compute_repair_losses(self.model, batch, weights=self.weights)
         batch_size = batch["target_height"].shape[0]
-        self.log("train/total_loss",    losses.total_loss,    on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
-        self.log("train/height_loss",   losses.height_loss,   on_step=True, on_epoch=True, batch_size=batch_size)
-        self.log("train/gradient_loss", losses.gradient_loss, on_step=True, on_epoch=True, batch_size=batch_size)
-        self.log("train/seam_loss",     losses.seam_loss,     on_step=True, on_epoch=True, batch_size=batch_size)
-        self.log("train/material_loss", losses.material_loss, on_step=True, on_epoch=True, batch_size=batch_size)
-        self.log("train/support_loss",  losses.support_loss,  on_step=True, on_epoch=True, batch_size=batch_size)
+        if getattr(self, "_trainer", None) is not None:
+            self.log("train/total_loss", losses.total_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
+            self.log("train/height_loss", losses.height_loss, on_step=True, on_epoch=True, batch_size=batch_size)
+            self.log("train/gradient_loss", losses.gradient_loss, on_step=True, on_epoch=True, batch_size=batch_size)
+            self.log("train/seam_loss", losses.seam_loss, on_step=True, on_epoch=True, batch_size=batch_size)
+            self.log("train/material_loss", losses.material_loss, on_step=True, on_epoch=True, batch_size=batch_size)
+            self.log("train/support_loss", losses.support_loss, on_step=True, on_epoch=True, batch_size=batch_size)
         return losses.total_loss
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate)
+        if self.lr_scheduler == "none":
+            return optimizer
+        if self.lr_scheduler != "cosine":
+            raise ValueError(f"Unsupported lr_scheduler: {self.lr_scheduler}")
+        trainer = getattr(self, "_trainer", None)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=self.trainer.max_epochs if self.trainer is not None else 100,
+            T_max=trainer.max_epochs if trainer is not None and trainer.max_epochs is not None else 100,
         )
         return {
             "optimizer": optimizer,
@@ -171,6 +180,8 @@ class TerrainRepairDataModule(pl.LightningDataModule):
         mask_mode: str,
         batch_size: int,
         num_workers: int,
+        prefetch_factor: int | None = 4,
+        prefill_iterations: int = 64,
     ):
         super().__init__()
         self.export_dirs = export_dirs
@@ -179,6 +190,8 @@ class TerrainRepairDataModule(pl.LightningDataModule):
         self.mask_mode = mask_mode
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.prefetch_factor = prefetch_factor
+        self.prefill_iterations = prefill_iterations
         self.dataset: TerrainRepairDataset | None = None
 
     def setup(self, stage: str | None = None) -> None:
@@ -188,6 +201,7 @@ class TerrainRepairDataModule(pl.LightningDataModule):
                 tile_size=self.tile_size,
                 stride_chunks=self.stride_chunks,
                 mask_mode=self.mask_mode,
+                prefill_iterations=self.prefill_iterations,
             )
 
     def train_dataloader(self) -> DataLoader:
@@ -202,7 +216,7 @@ class TerrainRepairDataModule(pl.LightningDataModule):
             "persistent_workers": self.num_workers > 0,
         }
         if self.num_workers > 0:
-            loader_kwargs["prefetch_factor"] = 2
+            loader_kwargs["prefetch_factor"] = self.prefetch_factor or 2
         return DataLoader(self.dataset, **loader_kwargs)
 
 class RepairEpochCallback(pl.Callback):
@@ -263,11 +277,7 @@ class RepairValidationCaseCallback(pl.Callback):
 
 
 class RepairCompatibleCheckpointCallback(pl.Callback):
-    """Save repair.pt-compatible checkpoints alongside the Lightning .ckpt files.
-
-    Also uploads the best checkpoint as a model artifact to LitLogger when
-    ``log_model`` is enabled on the trainer's LitLogger instance.
-    """
+    """Save repair.pt-compatible checkpoints alongside the Lightning .ckpt files."""
 
     def __init__(
         self,
@@ -287,12 +297,6 @@ class RepairCompatibleCheckpointCallback(pl.Callback):
         self.validation_callback = validation_callback
         self.save_every = save_every
         self.best_score = float("inf")
-
-    def _find_lit_logger(self, trainer: pl.Trainer) -> LitLogger | None:
-        for lg in trainer.loggers:
-            if isinstance(lg, LitLogger):
-                return lg
-        return None
 
     def _save(self, path: Path, trainer: pl.Trainer, pl_module: TerrainRepairLightningModule, interrupted: bool) -> None:
         dataset = self.datamodule.dataset
@@ -323,10 +327,6 @@ class RepairCompatibleCheckpointCallback(pl.Callback):
             self.best_score = self.validation_callback.best_score
             self._save(self.best_checkpoint_path, trainer, pl_module, interrupted=False)
 
-            lit_logger = self._find_lit_logger(trainer)
-            if lit_logger is not None:
-                lit_logger.log_model_artifact(str(self.best_checkpoint_path))
-
     def on_exception(self, trainer: pl.Trainer, pl_module: TerrainRepairLightningModule, exception: BaseException) -> None:
         if trainer.is_global_zero:
             self._save(self.checkpoint_path, trainer, pl_module, interrupted=True)
@@ -346,6 +346,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--lr-scheduler", default="none", choices=["none", "cosine"],
+                        help="Learning-rate schedule. Default preserves the legacy constant LR behavior.")
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--tile-size", type=int, default=128)
     parser.add_argument("--stride-chunks", type=int, default=1)
@@ -361,6 +363,10 @@ def main() -> None:
     parser.add_argument("--num-nodes", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=-1,
                         help="DataLoader workers: -1 → min(8, cpu_count-1), 0 → main process only.")
+    parser.add_argument("--prefetch-factor", type=int, default=4,
+                        help="Batches prefetched per DataLoader worker. Ignored when --num-workers=0.")
+    parser.add_argument("--prefill-iterations", type=int, default=64,
+                        help="Neighbor-averaging iterations used to build masked height prefill.")
     parser.add_argument("--matmul-precision", default="high", choices=["highest", "high", "medium"])
     parser.add_argument("--tf32", default="auto", choices=["auto", "on", "off"])
     parser.add_argument("--cudnn-benchmark", action=argparse.BooleanOptionalAction, default=True)
@@ -410,6 +416,8 @@ def main() -> None:
         mask_mode=args.mask_mode,
         batch_size=args.batch_size,
         num_workers=num_workers,
+        prefetch_factor=args.prefetch_factor,
+        prefill_iterations=args.prefill_iterations,
     )
     datamodule.setup("fit")
     assert datamodule.dataset is not None
@@ -417,6 +425,7 @@ def main() -> None:
     module = TerrainRepairLightningModule(
         num_material_classes=datamodule.dataset.num_material_classes,
         learning_rate=args.learning_rate,
+        lr_scheduler=args.lr_scheduler,
         channels_last=args.channels_last,
     )
     if args.resume is not None:
