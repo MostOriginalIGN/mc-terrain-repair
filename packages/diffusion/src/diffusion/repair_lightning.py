@@ -96,6 +96,9 @@ class TerrainRepairLightningModule(pl.LightningModule):
         learning_rate: float = 1e-4,
         lr_scheduler: str = "none",
         channels_last: bool = False,
+        model_base_channels: int = 64,
+        model_depth: int = 4,
+        model_bottleneck_dilations: str = "1,2,4,2",
         weights: RepairLossWeights = RepairLossWeights(),
     ):
         super().__init__()
@@ -104,15 +107,24 @@ class TerrainRepairLightningModule(pl.LightningModule):
             "learning_rate": learning_rate,
             "lr_scheduler": lr_scheduler,
             "channels_last": channels_last,
+            "model_base_channels": model_base_channels,
+            "model_depth": model_depth,
+            "model_bottleneck_dilations": model_bottleneck_dilations,
             "loss_weights": {
                 "height": weights.height,
+                "edge_height": weights.edge_height,
                 "gradient": weights.gradient,
                 "seam": weights.seam,
                 "material": weights.material,
                 "support": weights.support,
             },
         })
-        self.model = TerrainRepairUNet(num_material_classes=num_material_classes)
+        self.model = TerrainRepairUNet(
+            num_material_classes=num_material_classes,
+            base_channels=model_base_channels,
+            depth=model_depth,
+            bottleneck_dilations=model_bottleneck_dilations,
+        )
         self.learning_rate = learning_rate
         self.lr_scheduler = lr_scheduler
         self.channels_last = channels_last
@@ -149,6 +161,7 @@ class TerrainRepairLightningModule(pl.LightningModule):
         if getattr(self, "_trainer", None) is not None:
             self.log("train/total_loss", losses.total_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
             self.log("train/height_loss", losses.height_loss, on_step=True, on_epoch=True, batch_size=batch_size)
+            self.log("train/edge_height_loss", losses.edge_height_loss, on_step=True, on_epoch=True, batch_size=batch_size)
             self.log("train/gradient_loss", losses.gradient_loss, on_step=True, on_epoch=True, batch_size=batch_size)
             self.log("train/seam_loss", losses.seam_loss, on_step=True, on_epoch=True, batch_size=batch_size)
             self.log("train/material_loss", losses.material_loss, on_step=True, on_epoch=True, batch_size=batch_size)
@@ -349,6 +362,13 @@ def main() -> None:
     parser.add_argument("--lr-scheduler", default="none", choices=["none", "cosine"],
                         help="Learning-rate schedule. Default preserves the legacy constant LR behavior.")
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--model-base-channels", type=int, default=64)
+    parser.add_argument("--model-depth", type=int, default=4)
+    parser.add_argument(
+        "--model-bottleneck-dilations",
+        default="1,2,4,2",
+        help="Comma-separated dilation rates for bottleneck residual blocks. Empty disables extra dilated blocks.",
+    )
     parser.add_argument("--tile-size", type=int, default=128)
     parser.add_argument("--stride-chunks", type=int, default=1)
     parser.add_argument("--mask-mode", default="selection_mixed",
@@ -427,6 +447,9 @@ def main() -> None:
         learning_rate=args.learning_rate,
         lr_scheduler=args.lr_scheduler,
         channels_last=args.channels_last,
+        model_base_channels=args.model_base_channels,
+        model_depth=args.model_depth,
+        model_bottleneck_dilations=args.model_bottleneck_dilations,
     )
     if args.resume is not None:
         load_repair_checkpoint(args.resume, module.model, map_location="cpu")

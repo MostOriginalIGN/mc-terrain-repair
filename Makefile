@@ -17,6 +17,9 @@ REPAIR_CASES ?= ./repair_cases
 CASE ?=
 SAMPLE_COUNT ?= 5
 SEED ?= 7
+VARIANCE_OUT ?= ./artifacts/variance_analysis.json
+VARIANCE_CSV ?= ./artifacts/variance_windows.csv
+VARIANCE_LIMIT ?=
 LIMIT ?=
 WORKERS ?=
 EXPORT_SEED ?=
@@ -24,6 +27,9 @@ EPOCHS ?= 1
 BATCH_SIZE ?= 2
 LEARNING_RATE ?= 1e-4
 LR_SCHEDULER ?= none
+MODEL_BASE_CHANNELS ?= 64
+MODEL_DEPTH ?= 4
+MODEL_BOTTLENECK_DILATIONS ?= 1,2,4,2
 TRAIN_TILE_SIZE ?= 128
 STRIDE_CHUNKS ?= 1
 REPAIR_MASK_MODE ?= selection_mixed
@@ -61,7 +67,7 @@ MASK_LEFT ?= 48
 MASK_HEIGHT ?= 32
 MASK_WIDTH ?= 32
 
-.PHONY: help sync test export visualize train train-lightning train-legacy prepare-infer infer repair repair-case infer-gui view-repair
+.PHONY: help sync test export visualize analyze-variance train train-lightning train-legacy prepare-infer infer repair repair-case infer-gui view-repair
 
 help:
 	@printf "Targets:\n"
@@ -69,6 +75,7 @@ help:
 	@printf "  make test                                      Run exporter and repair tests\n"
 	@printf "  make export WORLD=... [OUT=...] [LIMIT=N] [WORKERS=N] [EXPORT_SEED=N]\n"
 	@printf "  make visualize [OUT=./data/exports]            Render export validation images\n"
+	@printf "  make analyze-variance [OUT=...]                Report height/material variance balance\n"
 	@printf "  make train [OUT=...] [EPOCHS=...] [BATCH_SIZE=...] [LIGHTNING_DEVICES=1] [AMP=auto|off|fp16|bf16]\n"
 	@printf "            PyTorch Lightning + LitLogger; optional: [LITLOGGER_NAME=...] [LITLOGGER_TEAMSPACE=user/ts]\n"
 	@printf "            [LITLOGGER_ROOT=path] [LITLOGGER_METADATA='k=v'] [LITLOGGER_LOG_MODEL=1]\n"
@@ -92,6 +99,16 @@ export:
 visualize:
 	uv run --package mc-terrain-exporter python scripts/visualize_export.py --export-dir "$(OUT)" --out-dir "$(RENDERS)" --sample-count $(SAMPLE_COUNT) --seed $(SEED)
 
+analyze-variance:
+	uv run --package mc-terrain-diffusion python scripts/analyze_variance.py \
+		--export-dir "$(OUT)" \
+		--tile-size $(TRAIN_TILE_SIZE) \
+		--stride-chunks $(STRIDE_CHUNKS) \
+		--seed $(SEED) \
+		--out "$(VARIANCE_OUT)" \
+		--csv-out "$(VARIANCE_CSV)" \
+		$(if $(VARIANCE_LIMIT),--limit-windows $(VARIANCE_LIMIT),)
+
 train:
 	uv run --package mc-terrain-diffusion train-terrain-repair \
 		--export-dir "$(OUT)" \
@@ -104,6 +121,9 @@ train:
 		--grad-accum-steps $(GRAD_ACCUM_STEPS) \
 		--learning-rate $(LEARNING_RATE) \
 		--lr-scheduler "$(LR_SCHEDULER)" \
+		--model-base-channels $(MODEL_BASE_CHANNELS) \
+		--model-depth $(MODEL_DEPTH) \
+		--model-bottleneck-dilations "$(MODEL_BOTTLENECK_DILATIONS)" \
 		--tile-size $(TRAIN_TILE_SIZE) \
 		--stride-chunks $(STRIDE_CHUNKS) \
 		--mask-mode "$(REPAIR_MASK_MODE)" \
@@ -134,7 +154,7 @@ train:
 train-lightning: train
 
 train-legacy:
-	uv run --package mc-terrain-diffusion python -m diffusion.repair_training --export-dir "$(OUT)" --checkpoint "$(REPAIR_CHECKPOINT)" --latest-checkpoint "$(REPAIR_LATEST_CHECKPOINT)" --best-checkpoint "$(REPAIR_BEST_CHECKPOINT)" --epochs $(EPOCHS) --save-every $(SAVE_EVERY) --batch-size $(BATCH_SIZE) --grad-accum-steps $(GRAD_ACCUM_STEPS) --learning-rate $(LEARNING_RATE) --tile-size $(TRAIN_TILE_SIZE) --stride-chunks $(STRIDE_CHUNKS) --mask-mode "$(REPAIR_MASK_MODE)" --device "$(DEVICE)" --amp "$(AMP)" --num-workers $(NUM_WORKERS) --grad-clip-norm $(GRAD_CLIP_NORM) --validation-cases-dir "$(REPAIR_CASES)" --validate-every $(VALIDATE_EVERY) --tf32 "$(TF32)" $(if $(TENSORBOARD),--tensorboard-dir "$(TENSORBOARD_DIR)",) $(if $(COMPILE),--compile,) $(if $(CHANNELS_LAST),--channels-last,) $(if $(RESUME),--resume "$(RESUME)",)
+	uv run --package mc-terrain-diffusion python -m diffusion.repair_training --export-dir "$(OUT)" --checkpoint "$(REPAIR_CHECKPOINT)" --latest-checkpoint "$(REPAIR_LATEST_CHECKPOINT)" --best-checkpoint "$(REPAIR_BEST_CHECKPOINT)" --epochs $(EPOCHS) --save-every $(SAVE_EVERY) --batch-size $(BATCH_SIZE) --grad-accum-steps $(GRAD_ACCUM_STEPS) --learning-rate $(LEARNING_RATE) --model-base-channels $(MODEL_BASE_CHANNELS) --model-depth $(MODEL_DEPTH) --model-bottleneck-dilations "$(MODEL_BOTTLENECK_DILATIONS)" --tile-size $(TRAIN_TILE_SIZE) --stride-chunks $(STRIDE_CHUNKS) --mask-mode "$(REPAIR_MASK_MODE)" --device "$(DEVICE)" --amp "$(AMP)" --num-workers $(NUM_WORKERS) --grad-clip-norm $(GRAD_CLIP_NORM) --validation-cases-dir "$(REPAIR_CASES)" --validate-every $(VALIDATE_EVERY) --tf32 "$(TF32)" $(if $(TENSORBOARD),--tensorboard-dir "$(TENSORBOARD_DIR)",) $(if $(COMPILE),--compile,) $(if $(CHANNELS_LAST),--channels-last,) $(if $(RESUME),--resume "$(RESUME)",)
 
 prepare-infer:
 	uv run --package mc-terrain-diffusion python scripts/prepare_infer_inputs.py --export-dir "$(OUT)" --out-dir "$(INPUTS)" --checkpoint "$(REPAIR_CHECKPOINT)" --tile-size $(INFER_TILE_SIZE) $(if $(ORIGIN_CHUNK_X),--origin-chunk-x $(ORIGIN_CHUNK_X),) $(if $(ORIGIN_CHUNK_Z),--origin-chunk-z $(ORIGIN_CHUNK_Z),) --mask-top $(MASK_TOP) --mask-left $(MASK_LEFT) --mask-height $(MASK_HEIGHT) --mask-width $(MASK_WIDTH)

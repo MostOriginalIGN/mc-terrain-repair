@@ -180,7 +180,8 @@ def test_repair_model_training_and_checkpoint_roundtrip(tmp_path) -> None:
 
     reloaded = TerrainRepairUNet(num_material_classes=dataset.num_material_classes)
     payload = load_repair_checkpoint(checkpoint, reloaded)
-    assert payload["meta"]["model_type"] == "deterministic_repair_v1"
+    assert payload["meta"]["model_type"] == "deterministic_repair_v2"
+    assert payload["meta"]["model_depth"] == 4
     assert payload["meta"]["epoch"] == 2
     assert payload["meta"]["global_step"] == 12
     assert payload["meta"]["export_dirs"] == [str(export_dir.resolve())]

@@ -25,7 +25,7 @@ from .repair_data import (
     compute_laplacian,
     estimate_support_from_material,
 )
-from .repair_model import TerrainRepairUNet
+from .repair_model import TerrainRepairUNet, TerrainRepairUNetV1
 
 
 def is_export_dir(path: str | Path) -> bool:
@@ -65,6 +65,7 @@ def resolve_training_export_dirs(export_dirs: list[str]) -> list[Path]:
 class RepairLossOutput:
     total_loss: torch.Tensor
     height_loss: torch.Tensor
+    edge_height_loss: torch.Tensor
     gradient_loss: torch.Tensor
     seam_loss: torch.Tensor
     material_loss: torch.Tensor
@@ -80,6 +81,7 @@ class RepairTrainingState:
 @dataclass(frozen=True)
 class RepairLossWeights:
     height: float = 1.0
+    edge_height: float = 0.35
     gradient: float = 0.5
     seam: float = 0.5
     material: float = 0.2
@@ -156,12 +158,17 @@ def compute_repair_losses(
 
     pred_grad_x, pred_grad_y = height_gradients(composite_height)
     target_grad_x, target_grad_y = height_gradients(target_height)
+    seam_mask = boundary_band(mask)
+    inner_edge_mask = (mask * seam_mask).clamp(0.0, 1.0)
+    edge_error = predicted_height - target_height
+    edge_height_loss = masked_mean(charbonnier(edge_error), inner_edge_mask) + charbonnier(
+        masked_mean(edge_error, inner_edge_mask)
+    )
     gradient_loss = masked_mean(
         charbonnier(pred_grad_x - target_grad_x) + charbonnier(pred_grad_y - target_grad_y),
         mask,
     )
 
-    seam_mask = boundary_band(mask)
     seam_loss = masked_mean(
         charbonnier(pred_grad_x - target_grad_x) + charbonnier(pred_grad_y - target_grad_y),
         seam_mask,
@@ -173,6 +180,7 @@ def compute_repair_losses(
 
     total_loss = (
         weights.height * height_loss
+        + weights.edge_height * edge_height_loss
         + weights.gradient * gradient_loss
         + weights.seam * seam_loss
         + weights.material * material_loss
@@ -181,6 +189,7 @@ def compute_repair_losses(
     return RepairLossOutput(
         total_loss=total_loss,
         height_loss=height_loss,
+        edge_height_loss=edge_height_loss,
         gradient_loss=gradient_loss,
         seam_loss=seam_loss,
         material_loss=material_loss,
@@ -295,15 +304,18 @@ def create_summary_writer(log_dir: str | None):
 
 def save_repair_checkpoint(
     path: str | Path,
-    model: TerrainRepairUNet,
+    model: TerrainRepairUNet | TerrainRepairUNetV1,
     optimizer: torch.optim.Optimizer | None,
     meta: dict[str, object] | None = None,
 ) -> None:
+    checkpoint_meta = dict(meta or {})
+    if hasattr(model, "checkpoint_config"):
+        checkpoint_meta.update(model.checkpoint_config())
     checkpoint = {
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict() if optimizer is not None else None,
         "num_material_classes": model.num_material_classes,
-        "meta": meta or {},
+        "meta": checkpoint_meta,
     }
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -312,10 +324,8 @@ def save_repair_checkpoint(
     os.replace(tmp_path, path)
 
 
-def load_repair_checkpoint(
+def _load_repair_checkpoint_payload(
     path: str | Path,
-    model: TerrainRepairUNet,
-    optimizer: torch.optim.Optimizer | None = None,
     map_location: str | torch.device = "cpu",
 ) -> dict[str, object]:
     path = Path(path)
@@ -334,10 +344,51 @@ def load_repair_checkpoint(
             "This file does not look like a deterministic repair checkpoint. "
             "Use `make train` to create artifacts/repair.pt before running `make repair`."
         )
+    return checkpoint
+
+
+def load_repair_checkpoint(
+    path: str | Path,
+    model: TerrainRepairUNet | TerrainRepairUNetV1,
+    optimizer: torch.optim.Optimizer | None = None,
+    map_location: str | torch.device = "cpu",
+) -> dict[str, object]:
+    checkpoint = _load_repair_checkpoint_payload(path, map_location=map_location)
     model.load_state_dict(checkpoint["model_state"])
     if optimizer is not None and checkpoint.get("optimizer_state") is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state"])
     return checkpoint
+
+
+def _model_kwargs_from_checkpoint(checkpoint: dict[str, object]) -> dict[str, object]:
+    meta = checkpoint.get("meta")
+    meta = meta if isinstance(meta, dict) else {}
+    return {
+        "base_channels": int(meta.get("model_base_channels", 64) or 64),
+        "depth": int(meta.get("model_depth", 4) or 4),
+        "bottleneck_dilations": str(meta.get("model_bottleneck_dilations", "1,2,4,2") or ""),
+    }
+
+
+def load_repair_model_from_checkpoint(
+    path: str | Path,
+    map_location: str | torch.device = "cpu",
+) -> tuple[TerrainRepairUNet | TerrainRepairUNetV1, dict[str, object]]:
+    """Load a repair model, selecting v1 or v2 architecture from the checkpoint."""
+    checkpoint = _load_repair_checkpoint_payload(path, map_location=map_location)
+    state_dict = checkpoint["model_state"]
+    num_material_classes = int(checkpoint.get("num_material_classes", 17))
+    if isinstance(state_dict, dict) and any(str(key).startswith("down1.") for key in state_dict):
+        model: TerrainRepairUNet | TerrainRepairUNetV1 = TerrainRepairUNetV1(
+            num_material_classes=num_material_classes,
+        )
+    else:
+        model = TerrainRepairUNet(
+            num_material_classes=num_material_classes,
+            **_model_kwargs_from_checkpoint(checkpoint),
+        )
+    model.load_state_dict(state_dict)
+    return model, checkpoint
 
 
 def restore_repair_training_state(payload: dict[str, object]) -> RepairTrainingState:
@@ -357,8 +408,14 @@ def build_repair_checkpoint_meta(
     interrupted: bool,
 ) -> dict[str, object]:
     export_dirs = [str(path) for path in dataset.export_dirs]
+    model_depth = int(getattr(args, "model_depth", 4) or 4)
+    model_base_channels = int(getattr(args, "model_base_channels", 64) or 64)
+    model_bottleneck_dilations = str(getattr(args, "model_bottleneck_dilations", "1,2,4,2") or "")
     return {
-        "model_type": "deterministic_repair_v1",
+        "model_type": "deterministic_repair_v2",
+        "model_base_channels": model_base_channels,
+        "model_depth": model_depth,
+        "model_bottleneck_dilations": model_bottleneck_dilations,
         "tile_size": args.tile_size,
         "stride_chunks": args.stride_chunks,
         "height_min": dataset.height_min,
@@ -559,6 +616,13 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--model-base-channels", type=int, default=64)
+    parser.add_argument("--model-depth", type=int, default=4)
+    parser.add_argument(
+        "--model-bottleneck-dilations",
+        default="1,2,4,2",
+        help="Comma-separated dilation rates for bottleneck residual blocks. Empty disables extra dilated blocks.",
+    )
     parser.add_argument("--tile-size", type=int, default=128)
     parser.add_argument("--stride-chunks", type=int, default=1)
     parser.add_argument(
@@ -605,7 +669,12 @@ def main() -> None:
     if args.num_workers > 0:
         loader_kwargs["prefetch_factor"] = 2
     loader = DataLoader(dataset, **loader_kwargs)
-    model = TerrainRepairUNet(num_material_classes=dataset.num_material_classes).to(device)
+    model = TerrainRepairUNet(
+        num_material_classes=dataset.num_material_classes,
+        base_channels=args.model_base_channels,
+        depth=args.model_depth,
+        bottleneck_dilations=args.model_bottleneck_dilations,
+    ).to(device)
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
@@ -683,6 +752,7 @@ def main() -> None:
                     if writer is not None and losses is not None:
                         writer.add_scalar("train/total_loss", losses.total_loss.item(), state.global_step)
                         writer.add_scalar("train/height_loss", losses.height_loss.item(), state.global_step)
+                        writer.add_scalar("train/edge_height_loss", losses.edge_height_loss.item(), state.global_step)
                         writer.add_scalar("train/gradient_loss", losses.gradient_loss.item(), state.global_step)
                         writer.add_scalar("train/seam_loss", losses.seam_loss.item(), state.global_step)
                         writer.add_scalar("train/material_loss", losses.material_loss.item(), state.global_step)
@@ -700,7 +770,8 @@ def main() -> None:
             if losses is not None:
                 print(
                     f"repair epoch {epoch + 1}/{args.epochs}: total={losses.total_loss.item():.4f} "
-                    f"height={losses.height_loss.item():.4f} gradient={losses.gradient_loss.item():.4f} "
+                    f"height={losses.height_loss.item():.4f} edge={losses.edge_height_loss.item():.4f} "
+                    f"gradient={losses.gradient_loss.item():.4f} "
                     f"seam={losses.seam_loss.item():.4f} material={losses.material_loss.item():.4f} "
                     f"support={losses.support_loss.item():.4f}"
                 )
@@ -765,6 +836,7 @@ __all__ = [
     "charbonnier",
     "compute_repair_losses",
     "load_repair_checkpoint",
+    "load_repair_model_from_checkpoint",
     "move_repair_batch",
     "resolve_amp_config",
     "restore_repair_training_state",

@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw
 import torch
 
 from exporter.visualize import heightmap_image, material_map_image, render_heightmap, render_material_map
-from exporter.vocab import NUM_CLASSES, UNKNOWN_INDEX
+from exporter.vocab import UNKNOWN_INDEX
 
 from .repair_data import (
     build_prefill_height,
@@ -21,7 +21,7 @@ from .repair_data import (
     estimate_support_from_material,
 )
 from .repair_model import TerrainRepairUNet
-from .repair_training import load_repair_checkpoint
+from .repair_training import load_repair_model_from_checkpoint
 
 SEA_LEVEL_Y = 64.0
 
@@ -347,8 +347,8 @@ def run_repair_job(
     known_support_path: str | Path | None = None,
 ) -> dict[str, Path]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TerrainRepairUNet(num_material_classes=NUM_CLASSES).to(device)
-    checkpoint_payload = load_repair_checkpoint(checkpoint, model, map_location=device)
+    model, checkpoint_payload = load_repair_model_from_checkpoint(checkpoint, map_location=device)
+    model = model.to(device)
     checkpoint_height_range = _height_range(checkpoint_payload)
 
     known_height_array = _load_array(known_height_path, "known height")
