@@ -26,9 +26,9 @@ from torch import Tensor
 from torch.nn import Module
 from torch.utils.data import DataLoader
 
-from diffusion.repair_data import TerrainRepairDataset
-from diffusion.repair_model import TerrainRepairUNet
-from diffusion.repair_training import (
+from unet.repair_data import TerrainRepairDataset
+from unet.repair_model import TerrainRepairUNet
+from unet.repair_training import (
     RepairLossWeights,
     RepairTrainingState,
     build_repair_checkpoint_meta,
@@ -82,7 +82,6 @@ def _precision_from_amp(amp: str) -> str:
         return "16-mixed"
     if amp == "bf16":
         return "bf16-mixed"
-    # auto
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         return "bf16-mixed"
     if torch.cuda.is_available():

@@ -7,13 +7,13 @@ import numpy as np
 import pytest
 import torch
 
-from diffusion.infer_inputs import prepare_inference_inputs
-from diffusion.repair_data import TerrainRepairDataset
-from diffusion.repair_inference import run_repair_job, run_saved_case_jobs
-from diffusion.repair_inference import main as repair_inference_main
-from diffusion.repair_lightning import TerrainRepairDataModule, TerrainRepairLightningModule
-from diffusion.repair_model import TerrainRepairUNet
-from diffusion.repair_training import (
+from unet.infer_inputs import prepare_inference_inputs
+from unet.repair_data import TerrainRepairDataset
+from unet.repair_inference import run_repair_job, run_saved_case_jobs
+from unet.repair_inference import main as repair_inference_main
+from unet.repair_lightning import TerrainRepairDataModule, TerrainRepairLightningModule
+from unet.repair_model import TerrainRepairUNet
+from unet.repair_training import (
     RepairTrainingState,
     build_repair_checkpoint_meta,
     compute_repair_losses,

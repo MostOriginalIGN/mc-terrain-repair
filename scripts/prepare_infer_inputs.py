@@ -7,15 +7,15 @@ from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-DIFFUSION_SRC = ROOT / 'packages' / 'diffusion' / 'src'
+UNET_SRC = ROOT / 'packages' / 'unet' / 'src'
 EXPORTER_SRC = ROOT / 'packages' / 'exporter' / 'src'
 DATASET_SRC = ROOT / 'packages' / 'dataset' / 'src'
 
-for src_path in (str(DIFFUSION_SRC), str(EXPORTER_SRC), str(DATASET_SRC)):
+for src_path in (str(UNET_SRC), str(EXPORTER_SRC), str(DATASET_SRC)):
     if src_path not in sys.path:
         sys.path.insert(0, src_path)
 
-from diffusion.infer_inputs import prepare_inference_inputs  # noqa: E402
+from unet.infer_inputs import prepare_inference_inputs  # noqa: E402
 
 
 def main() -> None:

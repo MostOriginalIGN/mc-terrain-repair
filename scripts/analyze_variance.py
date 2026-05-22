@@ -14,17 +14,17 @@ from typing import Iterable
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-DIFFUSION_SRC = ROOT / "packages" / "diffusion" / "src"
+UNET_SRC = ROOT / "packages" / "unet" / "src"
 EXPORTER_SRC = ROOT / "packages" / "exporter" / "src"
 DATASET_SRC = ROOT / "packages" / "dataset" / "src"
 
-for src_path in (str(DIFFUSION_SRC), str(EXPORTER_SRC), str(DATASET_SRC)):
+for src_path in (str(UNET_SRC), str(EXPORTER_SRC), str(DATASET_SRC)):
     if src_path not in sys.path:
         sys.path.insert(0, src_path)
 
-from diffusion.repair_data import compute_height_gradients  # noqa: E402
-from diffusion.repair_training import resolve_training_export_dirs  # noqa: E402
-from diffusion.data import SURFACE_INDEX, TerrainDiffusionDataset  # noqa: E402
+from unet.repair_data import compute_height_gradients  # noqa: E402
+from unet.repair_training import resolve_training_export_dirs  # noqa: E402
+from unet.data import SURFACE_INDEX, TerrainDiffusionDataset  # noqa: E402
 from exporter.vocab import CLASS_NAMES, UNKNOWN_INDEX  # noqa: E402
 
 

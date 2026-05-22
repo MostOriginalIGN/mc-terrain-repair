@@ -12,17 +12,17 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageTk
 
 ROOT = Path(__file__).resolve().parents[1]
-DIFFUSION_SRC = ROOT / 'packages' / 'diffusion' / 'src'
+UNET_SRC = ROOT / 'packages' / 'unet' / 'src'
 EXPORTER_SRC = ROOT / 'packages' / 'exporter' / 'src'
 DATASET_SRC = ROOT / 'packages' / 'dataset' / 'src'
 
-for src_path in (str(DIFFUSION_SRC), str(EXPORTER_SRC), str(DATASET_SRC)):
+for src_path in (str(UNET_SRC), str(EXPORTER_SRC), str(DATASET_SRC)):
     if src_path not in sys.path:
         sys.path.insert(0, src_path)
 
-from diffusion.data import TerrainDiffusionDataset  # noqa: E402
-from diffusion.infer_inputs import SelectionPlan, plan_chunk_selection, prepare_inference_inputs  # noqa: E402
-from diffusion.repair_inference import run_repair_job  # noqa: E402
+from unet.data import TerrainDiffusionDataset  # noqa: E402
+from unet.infer_inputs import SelectionPlan, plan_chunk_selection, prepare_inference_inputs  # noqa: E402
+from unet.repair_inference import run_repair_job  # noqa: E402
 from exporter.visualize import heightmap_image, material_map_image  # noqa: E402
 
 
@@ -218,7 +218,7 @@ class InferenceSelectionApp:
         self.out_dir = out_dir
         self.tile_size = tile_size
         self.root = tk.Tk()
-        self.root.title('mc-terrain-diffusion: repair selection')
+        self.root.title('mc-terrain-unet: repair selection')
 
         self.dataset = TerrainDiffusionDataset(export_dir, tile_size=tile_size, mask_mode='none')
         height_image, material_image, bounds, height_range = _build_selector_maps(self.dataset)

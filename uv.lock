@@ -5,9 +5,9 @@ requires-python = ">=3.11, <3.15"
 [manifest]
 members = [
     "mc-terrain-dataset",
-    "mc-terrain-diffusion",
     "mc-terrain-exporter",
     "mc-terrain-render",
+    "mc-terrain-unet",
 ]
 
 [[package]]
@@ -1215,40 +1215,6 @@ version = "0.1.0"
 source = { editable = "packages/dataset" }
 
 [[package]]
-name = "mc-terrain-diffusion"
-version = "0.1.0"
-source = { editable = "packages/diffusion" }
-dependencies = [
-    { name = "lightning" },
-    { name = "litlogger" },
-    { name = "mc-terrain-dataset" },
-    { name = "mc-terrain-exporter" },
-    { name = "numpy" },
-    { name = "tensorboard" },
-    { name = "torch" },
-    { name = "tqdm" },
-]
-
-[package.optional-dependencies]
-dev = [
-    { name = "pytest" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "lightning", specifier = "==2.6.1" },
-    { name = "litlogger", specifier = ">=2026.5.12" },
-    { name = "mc-terrain-dataset", editable = "packages/dataset" },
-    { name = "mc-terrain-exporter", editable = "packages/exporter" },
-    { name = "numpy" },
-    { name = "pytest", marker = "extra == 'dev'" },
-    { name = "tensorboard" },
-    { name = "torch" },
-    { name = "tqdm" },
-]
-provides-extras = ["dev"]
-
-[[package]]
 name = "mc-terrain-exporter"
 version = "0.1.0"
 source = { editable = "packages/exporter" }
@@ -1292,6 +1258,40 @@ requires-dist = [
     { name = "numpy" },
     { name = "pygame", specifier = ">=2.5" },
 ]
+
+[[package]]
+name = "mc-terrain-unet"
+version = "0.1.0"
+source = { editable = "packages/unet" }
+dependencies = [
+    { name = "lightning" },
+    { name = "litlogger" },
+    { name = "mc-terrain-dataset" },
+    { name = "mc-terrain-exporter" },
+    { name = "numpy" },
+    { name = "tensorboard" },
+    { name = "torch" },
+    { name = "tqdm" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "lightning", specifier = "==2.6.1" },
+    { name = "litlogger", specifier = ">=2026.5.12" },
+    { name = "mc-terrain-dataset", editable = "packages/dataset" },
+    { name = "mc-terrain-exporter", editable = "packages/exporter" },
+    { name = "numpy" },
+    { name = "pytest", marker = "extra == 'dev'" },
+    { name = "tensorboard" },
+    { name = "torch" },
+    { name = "tqdm" },
+]
+provides-extras = ["dev"]
 
 [[package]]
 name = "mdurl"
