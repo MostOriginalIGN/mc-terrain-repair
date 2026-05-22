@@ -66,6 +66,35 @@ def _height_range(checkpoint_payload: dict[str, object]) -> tuple[float, float] 
     return None
 
 
+def _checkpoint_warning_lines(checkpoint_payload: dict[str, object]) -> list[str]:
+    meta = checkpoint_payload.get("meta")
+    if not isinstance(meta, dict):
+        return ["checkpoint has no metadata; verify it is the intended repair model"]
+
+    warnings: list[str] = []
+    if bool(meta.get("interrupted")):
+        warnings.append("checkpoint was saved from an interrupted training run")
+
+    best_score = meta.get("best_score")
+    if not isinstance(best_score, (int, float)) or not math.isfinite(float(best_score)):
+        warnings.append("checkpoint has no finite validation best_score")
+
+    epoch = meta.get("epoch")
+    if isinstance(epoch, (int, float)) and int(epoch) <= 0:
+        warnings.append("checkpoint has not completed a full epoch")
+
+    return warnings
+
+
+def _warn_checkpoint_if_needed(checkpoint_payload: dict[str, object]) -> None:
+    warnings = _checkpoint_warning_lines(checkpoint_payload)
+    if not warnings:
+        return
+    print("Repair checkpoint warning:")
+    for warning in warnings:
+        print(f"  - {warning}")
+
+
 def _height_image_with_water(
     height: np.ndarray,
     mask: np.ndarray | None,
@@ -345,10 +374,13 @@ def run_repair_job(
     mask_path: str | Path,
     out_dir: str | Path,
     known_support_path: str | Path | None = None,
+    warn_checkpoint: bool = True,
 ) -> dict[str, Path]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, checkpoint_payload = load_repair_model_from_checkpoint(checkpoint, map_location=device)
     model = model.to(device)
+    if warn_checkpoint:
+        _warn_checkpoint_if_needed(checkpoint_payload)
     checkpoint_height_range = _height_range(checkpoint_payload)
 
     known_height_array = _load_array(known_height_path, "known height")
@@ -444,6 +476,7 @@ def run_saved_case_jobs(
             mask_path=case_dir / "mask.npy",
             out_dir=Path(out_dir).expanduser().resolve() / case_dir.name,
             known_support_path=case_dir / "known_support.npy",
+            warn_checkpoint=len(outputs) == 0,
         )
         outputs.append(output)
         case_panels.append((case_dir.name, output["combined_render"]))

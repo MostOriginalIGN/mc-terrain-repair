@@ -311,12 +311,19 @@ class RepairCompatibleCheckpointCallback(pl.Callback):
         self.save_every = save_every
         self.best_score = float("inf")
 
-    def _save(self, path: Path, trainer: pl.Trainer, pl_module: TerrainRepairLightningModule, interrupted: bool) -> None:
+    def _save(
+        self,
+        path: Path,
+        trainer: pl.Trainer,
+        pl_module: TerrainRepairLightningModule,
+        interrupted: bool,
+        completed_epochs: int | None = None,
+    ) -> None:
         dataset = self.datamodule.dataset
         if dataset is None:
             return
         state = RepairTrainingState(
-            completed_epochs=trainer.current_epoch + 1,
+            completed_epochs=trainer.current_epoch if completed_epochs is None else completed_epochs,
             global_step=trainer.global_step,
         )
         export_args = argparse.Namespace(**vars(self.args), best_score=self.validation_callback.best_score)
@@ -332,13 +339,13 @@ class RepairCompatibleCheckpointCallback(pl.Callback):
         if completed_epoch % self.save_every != 0 and completed_epoch != trainer.max_epochs:
             return
 
-        self._save(self.checkpoint_path, trainer, pl_module, interrupted=False)
+        self._save(self.checkpoint_path, trainer, pl_module, interrupted=False, completed_epochs=completed_epoch)
         if self.latest_checkpoint_path != self.checkpoint_path:
-            self._save(self.latest_checkpoint_path, trainer, pl_module, interrupted=False)
+            self._save(self.latest_checkpoint_path, trainer, pl_module, interrupted=False, completed_epochs=completed_epoch)
 
         if self.validation_callback.best_score < self.best_score:
             self.best_score = self.validation_callback.best_score
-            self._save(self.best_checkpoint_path, trainer, pl_module, interrupted=False)
+            self._save(self.best_checkpoint_path, trainer, pl_module, interrupted=False, completed_epochs=completed_epoch)
 
     def on_exception(self, trainer: pl.Trainer, pl_module: TerrainRepairLightningModule, exception: BaseException) -> None:
         if trainer.is_global_zero:
