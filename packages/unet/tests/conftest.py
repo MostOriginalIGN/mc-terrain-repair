@@ -5,7 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 for relative in [
-    ROOT / 'packages' / 'diffusion' / 'src',
+    ROOT / 'packages' / 'unet' / 'src',
     ROOT / 'packages' / 'exporter' / 'src',
     ROOT / 'packages' / 'dataset' / 'src',
 ]:

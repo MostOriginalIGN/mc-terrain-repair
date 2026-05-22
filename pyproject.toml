@@ -3,13 +3,13 @@ requires = ["setuptools>=82"]
 build-backend = "setuptools.build_meta"
 
 [tool.uv.workspace]
-members = ["packages/exporter", "packages/dataset", "packages/diffusion", "packages/render"]
+members = ["packages/exporter", "packages/dataset", "packages/unet", "packages/render"]
 
 [tool.uv.sources]
 mc-terrain-exporter = { workspace = true }
 mc-terrain-dataset = { workspace = true }
-mc-terrain-diffusion = { workspace = true }
+mc-terrain-unet = { workspace = true }
 mc-terrain-render = { workspace = true }
 
 [tool.pytest.ini_options]
-testpaths = ["packages/exporter/tests", "packages/diffusion/tests"]
+testpaths = ["packages/exporter/tests", "packages/unet/tests"]

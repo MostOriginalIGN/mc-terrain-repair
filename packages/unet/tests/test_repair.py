@@ -7,12 +7,13 @@ import numpy as np
 import pytest
 import torch
 
-from diffusion.infer_inputs import prepare_inference_inputs
-from diffusion.repair_data import TerrainRepairDataset
-from diffusion.repair_inference import run_repair_job, run_saved_case_jobs
-from diffusion.repair_inference import main as repair_inference_main
-from diffusion.repair_model import TerrainRepairUNet
-from diffusion.repair_training import (
+from unet.infer_inputs import prepare_inference_inputs
+from unet.repair_data import TerrainRepairDataset
+from unet.repair_inference import run_repair_job, run_saved_case_jobs
+from unet.repair_inference import main as repair_inference_main
+from unet.repair_lightning import TerrainRepairDataModule, TerrainRepairLightningModule
+from unet.repair_model import TerrainRepairUNet
+from unet.repair_training import (
     RepairTrainingState,
     build_repair_checkpoint_meta,
     compute_repair_losses,
@@ -82,6 +83,15 @@ def test_repair_dataset_features_and_unknown_material(tmp_path) -> None:
     assert epoch_zero_mask.sum().item() > 0
     assert epoch_one_mask.sum().item() > 0
     assert not torch.equal(epoch_zero_mask, epoch_one_mask)
+
+    selection_dataset = TerrainRepairDataset(export_dir, tile_size=128, mask_mode="selection_mixed", seed=13, cache_arrays=False)
+    selection_mask = selection_dataset[0]["mask"]
+    selection_dataset.set_mask_epoch(1)
+    next_selection_mask = selection_dataset[0]["mask"]
+    assert selection_mask.shape == (1, 128, 128)
+    assert 0 < selection_mask.sum().item() < 128 * 128
+    assert next_selection_mask.sum().item() > 0
+    assert not torch.equal(selection_mask, next_selection_mask)
 
 
 def test_repair_dataset_keeps_multi_export_windows_separate(tmp_path) -> None:
@@ -170,7 +180,8 @@ def test_repair_model_training_and_checkpoint_roundtrip(tmp_path) -> None:
 
     reloaded = TerrainRepairUNet(num_material_classes=dataset.num_material_classes)
     payload = load_repair_checkpoint(checkpoint, reloaded)
-    assert payload["meta"]["model_type"] == "deterministic_repair_v1"
+    assert payload["meta"]["model_type"] == "deterministic_repair_v2"
+    assert payload["meta"]["model_depth"] == 4
     assert payload["meta"]["epoch"] == 2
     assert payload["meta"]["global_step"] == 12
     assert payload["meta"]["export_dirs"] == [str(export_dir.resolve())]
@@ -179,6 +190,30 @@ def test_repair_model_training_and_checkpoint_roundtrip(tmp_path) -> None:
     bad_checkpoint.write_bytes(b"not a torch checkpoint")
     with pytest.raises(RuntimeError, match="Could not load repair checkpoint"):
         load_repair_checkpoint(bad_checkpoint, reloaded)
+
+
+def test_lightning_module_training_step(tmp_path) -> None:
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    _write_fake_export(export_dir, width_chunks=8, height_chunks=8)
+
+    datamodule = TerrainRepairDataModule(
+        export_dirs=[export_dir],
+        tile_size=128,
+        stride_chunks=1,
+        mask_mode="rectangle",
+        batch_size=1,
+        num_workers=0,
+    )
+    datamodule.setup("fit")
+    assert datamodule.dataset is not None
+
+    batch = _batch_from_sample(datamodule.dataset[0])
+    module = TerrainRepairLightningModule(num_material_classes=datamodule.dataset.num_material_classes)
+    loss = module.training_step(batch, batch_idx=0)
+
+    assert torch.isfinite(loss)
+    assert loss.item() > 0
 
 
 def test_repair_inference_outputs_and_preserves_known_pixels(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

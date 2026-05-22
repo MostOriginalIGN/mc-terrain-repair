@@ -30,7 +30,6 @@ CLASS_NAMES = [
     UNKNOWN_NAME,
 ]
 
-# Only preserve "surface" blocks
 VOCAB: dict[str, int] = {
     "minecraft:air": AIR_INDEX,
     "minecraft:cave_air": AIR_INDEX,
