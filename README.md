@@ -4,12 +4,19 @@ This repo exports surface-aligned Minecraft terrain tiles, renders them for insp
 
 The practical use case is terrain cleanup after large edits. If you clear out space for a base, castle, megaproject, rail line, or other large build, the surrounding land often ends up with harsh cut lines that no longer look like naturally generated Minecraft. The repair model is meant to fill those damaged regions back in with terrain that blends into the nearby world instead of looking hand-patched.
 
-Structure:
+This repo provides:
 
-- `packages/exporter`: reads Minecraft regions and writes `surface_*.npy` and `chunk_*.npy`
-- `packages/unet`: dataset assembly, training, inference, and validation
-- `packages/render`: lightweight 3D viewer for saved repair outputs
-- `scripts/`: thin CLI wrappers around the workspace packages
+- A Minecraft terrain exporter that converts local worlds into compact surface height and material tensors.
+- A deterministic repair U-Net for reconstructing masked terrain regions from nearby context.
+- Shared repair cases for validation and qualitative comparisons.
+- Lightweight renderers for inspection, 3D viewing, and figure-ready isometric PNGs.
+
+Repository layout:
+
+- `packages/exporter`: reads Minecraft regions and writes `surface_*.npy` and `chunk_*.npy`.
+- `packages/unet`: dataset assembly, training, inference, and validation.
+- `packages/render`: lightweight 3D viewer and figure exporter for saved repair outputs.
+- `scripts/`: thin CLI wrappers around the workspace packages.
 
 ## Requirements
 
@@ -33,10 +40,6 @@ Run the test suite once to make sure the environment is healthy:
 make test
 ```
 
-## What It Is For
-
-This is a terrain infill tool for local reconstruction. The main use case is clearing space for a large build, then repairing the surrounding terrain so it blends back into the world in a vanilla-like way.
-
 ## Typical Workflow
 
 ### 1. Export terrain
@@ -56,7 +59,7 @@ The exporter writes chunk-aligned `.npy` arrays into `OUT`:
 - `surface_x_z.npy`: 16x16 surface heights
 - `chunk_x_z.npy`: 16x16x40 surface-anchored material slabs
 
-Surface keep the terrain surface as a compact representation reduced to our vocabulary of allowed surface block classe. Blocks outside that list are represented as air.
+Surfaces keep the terrain as a compact representation reduced to our vocabulary of allowed surface block classes. Blocks outside that list are represented as air.
 
 The `chunk_x_z.npy` file stores a shallow vertical strip around that surface anchor for each `(x, z)` chunk. We use that depth information mainly to derive surface material and a simple support signal.
 
@@ -103,6 +106,36 @@ Artifacts land in:
 
 Validation runs against the shared saved cases in `repair_cases/` during training. If you need the older plain PyTorch loop, `make train-legacy` is still available.
 
+### Model Snapshot
+
+The repair model is a deterministic U-Net that predicts a height residual, surface material logits, and a support proxy for the masked terrain region. It conditions on the known normalized height, a simple prefilled height estimate, the mask, boundary distance, prefill gradients and Laplacian, known support, and one-hot surface material classes.
+
+The current v2 configuration uses 64 base channels, four encoder/decoder stages, residual blocks, and a dilated bottleneck with dilation rates `1,2,4,2` to increase terrain-scale context without changing the 128x128 tile interface.
+
+## Training run snapshot:
+
+- Dataset scale: 52 worlds, 4,096 chunks per world, 212,992 chunks total.
+- Epoch: 85.
+- Epoch average loss: 0.0470.
+- Step loss mean/median: 0.0467 / 0.0460.
+- Step loss min/max: 0.0240 / 0.0770.
+
+### Hillside
+
+![Hillside terrain repair figure](docs/figures/Hillside.png)
+
+### Coast
+
+![Beach terrain repair figure](docs/figures/Beach.png)
+
+### River
+
+![River terrain repair figure](docs/figures/River.png)
+
+### Sandy Beach
+
+![Sandy Beach terrain repair figure](docs/figures/Sandy-Beach.png)
+
 ## Inference And Evaluation
 
 Prepare a scratch inference window from exported terrain:
@@ -130,6 +163,14 @@ View saved repair outputs in the 3D viewer:
 ```bash
 make view-repair
 ```
+
+Export white-background isometric triptychs:
+
+```bash
+make generate-figures
+```
+
+Each case renders as masked input, repaired terrain, and true terrain under `outputs/figures/`, plus a stacked `all_cases.png` contact sheet.
 
 ## Common Commands
 

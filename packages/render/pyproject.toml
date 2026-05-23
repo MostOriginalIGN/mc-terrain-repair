@@ -9,11 +9,13 @@ description = "Simple pygame 3D viewer for repair case outputs"
 requires-python = ">=3.11,<3.15"
 dependencies = [
     "numpy",
+    "pillow",
     "pygame>=2.5",
 ]
 
 [project.scripts]
 repair-3d = "repair_viewer.app:main"
+generate-figures = "repair_viewer.app:figures_main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

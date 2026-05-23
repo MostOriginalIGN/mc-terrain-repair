@@ -1250,12 +1250,14 @@ version = "0.1.0"
 source = { editable = "packages/render" }
 dependencies = [
     { name = "numpy" },
+    { name = "pillow" },
     { name = "pygame" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "numpy" },
+    { name = "pillow" },
     { name = "pygame", specifier = ">=2.5" },
 ]
 

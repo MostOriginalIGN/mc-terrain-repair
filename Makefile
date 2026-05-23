@@ -13,6 +13,7 @@ KNOWN_MATERIAL ?= $(INPUTS)/known_material.npy
 MASK ?= $(INPUTS)/mask.npy
 OUTPUTS ?= ./outputs
 SAVED_CASES ?= $(OUTPUTS)/saved_cases
+FIGURES ?= $(OUTPUTS)/figures
 REPAIR_CASES ?= ./repair_cases
 CASE ?=
 SAMPLE_COUNT ?= 5
@@ -67,7 +68,7 @@ MASK_LEFT ?= 48
 MASK_HEIGHT ?= 32
 MASK_WIDTH ?= 32
 
-.PHONY: help sync test export visualize analyze-variance train train-lightning train-legacy prepare-infer infer repair repair-case infer-gui view-repair
+.PHONY: help sync test export visualize analyze-variance train train-lightning train-legacy prepare-infer infer repair repair-case infer-gui view-repair generate-figures
 
 help:
 	@printf "Targets:\n"
@@ -86,6 +87,7 @@ help:
 	@printf "  make repair-case CASE=name                     Run deterministic repair on REPAIR_CASES/name\n"
 	@printf "  make infer-gui [REPAIR_CHECKPOINT=...]         Pick a chunk region in a local GUI and run U-Net repair\n"
 	@printf "  make view-repair [SAVED_CASES=...]             Open 3D repair output viewer (pygame)\n"
+	@printf "  make generate-figures [SAVED_CASES=...]        Export isometric PNG figures\n"
 
 sync:
 	uv sync --all-packages --all-extras
@@ -173,3 +175,6 @@ infer-gui:
 
 view-repair:
 	uv run --package mc-terrain-render repair-3d --cases-dir "$(SAVED_CASES)" --repair-cases-dir "$(REPAIR_CASES)"
+
+generate-figures:
+	uv run --package mc-terrain-render generate-figures --cases-dir "$(SAVED_CASES)" --repair-cases-dir "$(REPAIR_CASES)" --out-dir "$(FIGURES)" $(if $(LIMIT),--limit $(LIMIT),)
