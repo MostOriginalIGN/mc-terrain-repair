@@ -11,7 +11,10 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-SEA_LEVEL_WORLD = 64.0
+SEA_LEVEL_WORLD = 63.0
+WATER_RGB = np.array([62, 118, 188], dtype=np.float32)
+WATER_SHADE = 0.82
+WATER_COLOR = np.clip(WATER_RGB * WATER_SHADE, 0, 255).astype(np.uint8)
 
 _VOCAB_RGB: list[tuple[int, int, int]] = [
     (200, 225, 255),
@@ -43,6 +46,8 @@ class Scene:
     mask: np.ndarray
     sea_y: float
     visible: np.ndarray | None = None
+    fill_hidden_edges: bool = True
+    fill_mask_edges: bool = False
 
 
 def _discover_cases(root: Path) -> list[Path]:
@@ -101,7 +106,14 @@ def load_scene(case_dir: Path, repair_cases_dir: Path) -> Scene:
                  material=material, mask=mask, sea_y=sea_y)
 
 
-def _cell_rgb(material: np.ndarray, mask: np.ndarray, r: int, c: int, *, highlight_known: bool = True) -> np.ndarray:
+def _cell_rgb(
+    material: np.ndarray,
+    mask: np.ndarray,
+    r: int,
+    c: int,
+    *,
+    highlight_known: bool = True,
+) -> np.ndarray:
     mi = int(material[r, c]) % len(_VOCAB_RGB)
     base = np.array(_VOCAB_RGB[mi], dtype=np.float32)
     if highlight_known and mask[r, c] <= 0:
@@ -109,7 +121,12 @@ def _cell_rgb(material: np.ndarray, mask: np.ndarray, r: int, c: int, *, highlig
     return base
 
 
-def build_mesh(scene: Scene, *, highlight_known: bool = True) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def build_mesh(
+    scene: Scene,
+    *,
+    highlight_known: bool = True,
+    full_water_plane: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     H, W = scene.height.shape
     visible = np.ones((H, W), dtype=bool) if scene.visible is None else scene.visible.astype(bool)
     if visible.shape != scene.height.shape:
@@ -137,8 +154,10 @@ def build_mesh(scene: Scene, *, highlight_known: bool = True) -> tuple[np.ndarra
         colors_list.append(col)
         base_v += 4
 
-    def neighbor_height(r: int, c: int) -> float:
-        if 0 <= r < H and 0 <= c < W and visible[r, c]:
+    def neighbor_height(r: int, c: int) -> float | None:
+        if 0 <= r < H and 0 <= c < W:
+            if not visible[r, c]:
+                return floor_y if scene.fill_hidden_edges else None
             return float(scene.height[r, c])
         return floor_y
 
@@ -149,7 +168,13 @@ def build_mesh(scene: Scene, *, highlight_known: bool = True) -> tuple[np.ndarra
             y = float(scene.height[r, c])
             x0, x1 = float(c), float(c + 1)
             z0, z1 = float(r), float(r + 1)
-            rgb = _cell_rgb(scene.material, scene.mask, r, c, highlight_known=highlight_known)
+            rgb = _cell_rgb(
+                scene.material,
+                scene.mask,
+                r,
+                c,
+                highlight_known=highlight_known,
+            )
 
             add_quad(np.array([
                 [x0, y, z0], [x1, y, z0],
@@ -157,46 +182,65 @@ def build_mesh(scene: Scene, *, highlight_known: bool = True) -> tuple[np.ndarra
             ]), _SHADE["top"], rgb)
 
             ny_px = neighbor_height(r, c + 1)
-            if ny_px < y:
+            if ny_px is not None and ny_px < y:
                 add_quad(np.array([
                     [x1, ny_px, z0], [x1, y,    z0],
                     [x1, y,    z1],  [x1, ny_px, z1],
                 ]), _SHADE["px"], rgb)
 
             ny_nx = neighbor_height(r, c - 1)
-            if ny_nx < y:
+            if ny_nx is not None and ny_nx < y:
                 add_quad(np.array([
                     [x0, y,    z0], [x0, ny_nx, z0],
                     [x0, ny_nx, z1], [x0, y,    z1],
                 ]), _SHADE["nx"], rgb)
 
             ny_pz = neighbor_height(r + 1, c)
-            if ny_pz < y:
+            if ny_pz is not None and ny_pz < y:
                 add_quad(np.array([
                     [x0, y,    z1], [x1, y,    z1],
                     [x1, ny_pz, z1], [x0, ny_pz, z1],
                 ]), _SHADE["pz"], rgb)
 
             ny_nz = neighbor_height(r - 1, c)
-            if ny_nz < y:
+            if ny_nz is not None and ny_nz < y:
                 add_quad(np.array([
                     [x0, ny_nz, z0], [x1, ny_nz, z0],
                     [x1, y,    z0],  [x0, y,    z0],
                 ]), _SHADE["nz"], rgb)
 
-    WATER_RGB = np.array([62, 118, 188], dtype=np.float32)
-    WATER_SHADE = 0.82
+            if scene.fill_mask_edges:
+                if c + 1 < W and not visible[r, c + 1] and scene.mask[r, c + 1] > 0:
+                    add_quad(np.array([
+                        [x1, floor_y, z0], [x1, y,       z0],
+                        [x1, y,       z1], [x1, floor_y, z1],
+                    ]), _SHADE["px"], rgb)
+                if c > 0 and not visible[r, c - 1] and scene.mask[r, c - 1] > 0:
+                    add_quad(np.array([
+                        [x0, y,       z0], [x0, floor_y, z0],
+                        [x0, floor_y, z1], [x0, y,       z1],
+                    ]), _SHADE["nx"], rgb)
+                if r + 1 < H and not visible[r + 1, c] and scene.mask[r + 1, c] > 0:
+                    add_quad(np.array([
+                        [x0, y,       z1], [x1, y,       z1],
+                        [x1, floor_y, z1], [x0, floor_y, z1],
+                    ]), _SHADE["pz"], rgb)
+                if r > 0 and not visible[r - 1, c] and scene.mask[r - 1, c] > 0:
+                    add_quad(np.array([
+                        [x0, floor_y, z0], [x1, floor_y, z0],
+                        [x1, y,       z0], [x0, y,       z0],
+                    ]), _SHADE["nz"], rgb)
+
     sy = scene.sea_y
-    hmap = scene.height
 
     for r in range(H):
         c = 0
         while c < W:
-            if not visible[r, c] or float(hmap[r, c]) >= sy:
+            if not visible[r, c] or (not full_water_plane and float(scene.height[r, c]) >= sy):
                 c += 1
                 continue
             c0 = c
-            while c < W and visible[r, c] and float(hmap[r, c]) < sy:
+            while c < W and visible[r, c] and (full_water_plane or float(scene.height[r, c]) < sy):
                 c += 1
             x0, x1 = float(c0), float(c)
             z0, z1 = float(r), float(r + 1)
@@ -264,9 +308,25 @@ def _metadata_range(case_dir: Path) -> tuple[float, float] | None:
     return None
 
 
-def _load_height_for_figure(path: Path, reference_dir: Path) -> np.ndarray:
+def _saved_output_height_range(case_dir: Path) -> tuple[float, float] | None:
+    raw_path = case_dir / "height.npy"
+    world_path = case_dir / "height_world.npy"
+    if not raw_path.is_file() or not world_path.is_file():
+        return None
+    raw = np.load(raw_path).astype(np.float64)
+    world = np.load(world_path).astype(np.float64)
+    if raw.shape != world.shape:
+        return None
+    raw_span = float(np.nanmax(raw) - np.nanmin(raw))
+    if raw_span <= 1e-9:
+        return None
+    scale = float(np.nanmax(world) - np.nanmin(world)) / raw_span
+    offset = float(np.nanmin(world)) - float(np.nanmin(raw)) * scale
+    return offset, offset + scale
+
+
+def _load_height_for_figure(path: Path, height_range: tuple[float, float] | None) -> np.ndarray:
     height = np.load(path).astype(np.float64)
-    height_range = _metadata_range(reference_dir)
     if height_range is not None and float(np.nanmax(height)) <= 1.5 and float(np.nanmin(height)) >= -0.1:
         hmin, hmax = height_range
         height = height * (hmax - hmin) + hmin
@@ -278,17 +338,24 @@ def _figure_scene_from_arrays(
     material: np.ndarray,
     *,
     visible: np.ndarray | None = None,
+    mask: np.ndarray | None = None,
+    fill_hidden_edges: bool = True,
+    fill_mask_edges: bool = False,
 ) -> Scene:
     if material.shape != height.shape:
         raise ValueError(f"material {material.shape} != height {height.shape}")
     if visible is not None and visible.shape != height.shape:
         raise ValueError(f"visible {visible.shape} != height {height.shape}")
+    if mask is not None and mask.shape != height.shape:
+        raise ValueError(f"mask {mask.shape} != height {height.shape}")
     return Scene(
         height=height,
         material=material,
-        mask=np.ones(height.shape, dtype=np.float32),
+        mask=np.zeros(height.shape, dtype=np.float32) if mask is None else mask.astype(np.float32),
         sea_y=SEA_LEVEL_WORLD,
         visible=visible,
+        fill_hidden_edges=fill_hidden_edges,
+        fill_mask_edges=fill_mask_edges,
     )
 
 
@@ -302,20 +369,32 @@ def _load_figure_scenes(case_dir: Path, repair_cases_dir: Path) -> list[tuple[st
         mask_path = reference_dir / "mask.npy"
     mask = np.load(mask_path).astype(np.float32)
 
-    known_height = _load_height_for_figure(reference_dir / "known_height.npy", reference_dir)
+    height_range = _saved_output_height_range(case_dir) or _metadata_range(reference_dir)
+
+    known_height = _load_height_for_figure(reference_dir / "known_height.npy", height_range)
     known_material = np.load(reference_dir / "known_material.npy")
-    target_height = _load_height_for_figure(reference_dir / "target_height.npy", reference_dir)
+    target_height = _load_height_for_figure(reference_dir / "target_height.npy", height_range)
     target_material = np.load(reference_dir / "target_material.npy")
 
     repaired_height_path = case_dir / "height_world.npy"
     if not repaired_height_path.is_file():
         repaired_height_path = case_dir / "height.npy"
-    repaired_height = _load_height_for_figure(repaired_height_path, reference_dir)
+    repaired_height = _load_height_for_figure(repaired_height_path, height_range)
     repaired_material = np.load(case_dir / "material.npy")
 
     visible_known = mask <= 0
     return [
-        ("(a) Masked Input", _figure_scene_from_arrays(known_height, known_material, visible=visible_known)),
+        (
+            "(a) Masked Input",
+            _figure_scene_from_arrays(
+                known_height,
+                known_material,
+                visible=visible_known,
+                mask=mask,
+                fill_hidden_edges=False,
+                fill_mask_edges=True,
+            ),
+        ),
         ("(b) Repaired", _figure_scene_from_arrays(repaired_height, repaired_material)),
         ("(c) True Terrain", _figure_scene_from_arrays(target_height, target_material)),
     ]
@@ -335,6 +414,104 @@ def _font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
+def _rasterize_triangle(
+    pixels: np.ndarray,
+    z_buffer: np.ndarray,
+    points: np.ndarray,
+    depths: np.ndarray,
+    color: np.ndarray,
+) -> None:
+    height, width = z_buffer.shape
+    min_x = max(0, int(np.floor(float(points[:, 0].min()))))
+    max_x = min(width - 1, int(np.ceil(float(points[:, 0].max()))))
+    min_y = max(0, int(np.floor(float(points[:, 1].min()))))
+    max_y = min(height - 1, int(np.ceil(float(points[:, 1].max()))))
+    if min_x > max_x or min_y > max_y:
+        return
+
+    x0, y0 = points[0]
+    x1, y1 = points[1]
+    x2, y2 = points[2]
+    denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+    if abs(float(denom)) < 1e-9:
+        return
+
+    yy, xx = np.mgrid[min_y : max_y + 1, min_x : max_x + 1]
+    sample_x = xx.astype(np.float64) + 0.5
+    sample_y = yy.astype(np.float64) + 0.5
+    w0 = ((y1 - y2) * (sample_x - x2) + (x2 - x1) * (sample_y - y2)) / denom
+    w1 = ((y2 - y0) * (sample_x - x2) + (x0 - x2) * (sample_y - y2)) / denom
+    w2 = 1.0 - w0 - w1
+    inside = (w0 >= -1e-6) & (w1 >= -1e-6) & (w2 >= -1e-6)
+    if not inside.any():
+        return
+
+    tri_depth = w0 * depths[0] + w1 * depths[1] + w2 * depths[2]
+    window = z_buffer[min_y : max_y + 1, min_x : max_x + 1]
+    update = inside & (tri_depth < window)
+    if not update.any():
+        return
+    window[update] = tri_depth[update]
+    pixels[min_y : max_y + 1, min_x : max_x + 1][update] = color
+
+
+def _rasterize_depth_line(
+    pixels: np.ndarray,
+    z_buffer: np.ndarray,
+    p0: np.ndarray,
+    p1: np.ndarray,
+    z0: float,
+    z1: float,
+    color: np.ndarray,
+) -> None:
+    height, width = z_buffer.shape
+    dx = float(p1[0] - p0[0])
+    dy = float(p1[1] - p0[1])
+    steps = max(1, int(np.ceil(max(abs(dx), abs(dy)))))
+    for step in range(steps + 1):
+        t = step / steps
+        x = int(round(float(p0[0] + dx * t)))
+        y = int(round(float(p0[1] + dy * t)))
+        if not (0 <= x < width and 0 <= y < height):
+            continue
+        depth = float(z0 + (z1 - z0) * t)
+        if depth <= z_buffer[y, x] + 0.04:
+            pixels[y, x] = color
+
+
+def _rasterize_quads(
+    image: Image.Image,
+    points: np.ndarray,
+    depths: np.ndarray,
+    faces: np.ndarray,
+    colors: np.ndarray,
+) -> Image.Image:
+    pixels = np.array(image)
+    z_buffer = np.full(pixels.shape[:2], np.inf, dtype=np.float64)
+    for face, color in zip(faces, colors, strict=True):
+        quad_points = points[face]
+        quad_depths = depths[face]
+        _rasterize_triangle(pixels, z_buffer, quad_points[[0, 1, 2]], quad_depths[[0, 1, 2]], color)
+        _rasterize_triangle(pixels, z_buffer, quad_points[[0, 2, 3]], quad_depths[[0, 2, 3]], color)
+    for face, color in zip(faces, colors, strict=True):
+        if np.array_equal(color, WATER_COLOR):
+            continue
+        quad_points = points[face]
+        quad_depths = depths[face]
+        outline = np.maximum(0, (color.astype(np.float32) * 0.62)).astype(np.uint8)
+        for start, end in ((0, 1), (1, 2), (2, 3), (3, 0)):
+            _rasterize_depth_line(
+                pixels,
+                z_buffer,
+                quad_points[start],
+                quad_points[end],
+                float(quad_depths[start]),
+                float(quad_depths[end]),
+                outline,
+            )
+    return Image.fromarray(pixels, mode="RGB")
+
+
 def render_isometric_scene(
     scene: Scene,
     *,
@@ -342,7 +519,7 @@ def render_isometric_scene(
     margin: int = 18,
     supersample: int = 2,
 ) -> Image.Image:
-    verts, faces, colors, _center = build_mesh(scene, highlight_known=False)
+    verts, faces, colors, _center = build_mesh(scene, highlight_known=False, full_water_plane=True)
     canvas = Image.new("RGB", size, (255, 255, 255))
     if verts.size == 0 or faces.size == 0:
         return canvas
@@ -381,14 +558,7 @@ def render_isometric_scene(
     )
     draw.ellipse(shadow_box, fill=(236, 238, 240))
 
-    depth = projected[:, 2][faces].mean(axis=1)
-    for face_index in np.argsort(-depth):
-        indexes = faces[face_index]
-        polygon = [(float(points[i, 0]), float(points[i, 1])) for i in indexes]
-        col = colors[face_index]
-        outline = tuple(int(max(0, min(255, channel * 0.78))) for channel in col)
-        fill = (int(col[0]), int(col[1]), int(col[2]))
-        draw.polygon(polygon, fill=fill, outline=outline)
+    image = _rasterize_quads(image, points, projected[:, 2], faces, colors)
 
     if aa > 1:
         image = image.resize(size, resample=Image.Resampling.LANCZOS)

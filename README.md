@@ -115,10 +115,13 @@ The current v2 configuration uses 64 base channels, four encoder/decoder stages,
 ## Training run snapshot:
 
 - Dataset scale: 52 worlds, 4,096 chunks per world, 212,992 chunks total.
-- Epoch: 85.
-- Epoch average loss: 0.0470.
-- Step loss mean/median: 0.0467 / 0.0460.
-- Step loss min/max: 0.0240 / 0.0770.
+- Epoch: 350
+- Validation score: 0.0528
+- Height MAE: 0.0097
+- Seam MAE: 0.0019
+- Material accuracy: 0.7922
+- Support MSE: 0.0068
+- Training loss: 0.033
 
 ### Hillside
 

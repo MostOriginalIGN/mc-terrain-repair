@@ -23,7 +23,7 @@ from .repair_data import (
 from .repair_model import TerrainRepairUNet
 from .repair_training import load_repair_model_from_checkpoint
 
-SEA_LEVEL_Y = 64.0
+SEA_LEVEL_Y = 63.0
 
 
 def _load_array(path_str: str | Path, name: str) -> np.ndarray:
