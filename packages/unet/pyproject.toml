@@ -20,6 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+onnx = ["onnx", "onnxruntime", "onnxscript"]
 
 [project.scripts]
 train-terrain-repair = "unet.repair_lightning:main"

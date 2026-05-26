@@ -145,6 +145,7 @@ class TerrainRepairDataset(TerrainDiffusionDataset):
         tile_size: int = 128,
         stride_chunks: int = 1,
         mask_mode: str = "mixed",
+        augment: bool = False,
         mask_fraction_range: tuple[float, float] = (0.15, 0.5),
         seed: int = 0,
         cache_arrays: bool = True,
@@ -161,6 +162,7 @@ class TerrainRepairDataset(TerrainDiffusionDataset):
             cache_arrays=cache_arrays,
             height_range=height_range,
         )
+        self.augment = bool(augment)
         self.prefill_iterations = prefill_iterations
         self.mask_epoch = 0
 
@@ -177,6 +179,14 @@ class TerrainRepairDataset(TerrainDiffusionDataset):
 
         target_height = self._normalize_height(surface).astype(np.float32)
         mask = self._build_mask(index, target_height=target_height, materials=materials, support=support)
+        if self.augment:
+            target_height, materials, support, mask = self._augment_base_arrays(
+                index,
+                target_height=target_height,
+                materials=materials,
+                support=support,
+                mask=mask,
+            )
         known_height = target_height * (1.0 - mask)
         known_material = materials.copy()
         known_material[mask.astype(bool)] = UNKNOWN_INDEX
@@ -216,6 +226,49 @@ class TerrainRepairDataset(TerrainDiffusionDataset):
             "origin_chunk_x": torch.tensor(sample.origin_chunk_x),
             "origin_chunk_z": torch.tensor(sample.origin_chunk_z),
         }
+
+    def _augment_base_arrays(
+        self,
+        index: int,
+        target_height: np.ndarray,
+        materials: np.ndarray,
+        support: np.ndarray,
+        mask: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        rng = self._rng(index, salt=17)
+
+        def _flip_h(arr: np.ndarray) -> np.ndarray:
+            return np.flip(arr, axis=1)
+
+        def _flip_v(arr: np.ndarray) -> np.ndarray:
+            return np.flip(arr, axis=0)
+
+        def _rot90(arr: np.ndarray, k: int) -> np.ndarray:
+            return np.rot90(arr, k=k, axes=(0, 1))
+
+        if float(rng.random()) < 0.5:
+            target_height = _flip_h(target_height)
+            materials = _flip_h(materials)
+            support = _flip_h(support)
+            mask = _flip_h(mask)
+        if float(rng.random()) < 0.5:
+            target_height = _flip_v(target_height)
+            materials = _flip_v(materials)
+            support = _flip_v(support)
+            mask = _flip_v(mask)
+        k = int(rng.integers(0, 4))
+        if k:
+            target_height = _rot90(target_height, k)
+            materials = _rot90(materials, k)
+            support = _rot90(support, k)
+            mask = _rot90(mask, k)
+
+        return (
+            np.ascontiguousarray(target_height, dtype=np.float32),
+            np.ascontiguousarray(materials, dtype=np.int64),
+            np.ascontiguousarray(support, dtype=np.float32),
+            np.ascontiguousarray(mask, dtype=np.float32),
+        )
 
     def _rng(self, index: int, salt: int = 0) -> np.random.Generator:
         return np.random.default_rng(self.seed + self.mask_epoch * MASK_EPOCH_STRIDE + index * 1009 + salt)

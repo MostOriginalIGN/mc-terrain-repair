@@ -367,6 +367,7 @@ def _model_kwargs_from_checkpoint(checkpoint: dict[str, object]) -> dict[str, ob
         "base_channels": int(meta.get("model_base_channels", 64) or 64),
         "depth": int(meta.get("model_depth", 4) or 4),
         "bottleneck_dilations": str(meta.get("model_bottleneck_dilations", "1,2,4,2") or ""),
+        "dropout": float(meta.get("model_dropout", 0.0) or 0.0),
     }
 
 
@@ -426,6 +427,11 @@ def build_repair_checkpoint_meta(
         "global_step": state.global_step,
         "interrupted": interrupted,
         "mask_mode": getattr(args, "mask_mode", None),
+        "dropout": getattr(args, "dropout", 0.0),
+        "weight_decay": getattr(args, "weight_decay", 1e-2),
+        "augment": getattr(args, "augment", False),
+        "lr_scheduler": getattr(args, "lr_scheduler", "none"),
+        "learning_rate": getattr(args, "learning_rate", 1e-4),
         "amp": getattr(args, "amp", None),
         "channels_last": getattr(args, "channels_last", None),
         "compile": getattr(args, "compile", None),

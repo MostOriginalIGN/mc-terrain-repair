@@ -181,8 +181,9 @@ Each case renders as masked input, repaired terrain, and true terrain under `out
 make help
 make test
 make analyze-variance OUT=./data/chunks
-make train-lightning
+make train
 make train-legacy
+make export-onnx REPAIR_CHECKPOINT=./artifacts/repair.pt
 make repair
 ```
 

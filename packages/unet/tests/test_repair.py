@@ -94,6 +94,48 @@ def test_repair_dataset_features_and_unknown_material(tmp_path) -> None:
     assert not torch.equal(selection_mask, next_selection_mask)
 
 
+def test_repair_dataset_augmentation_toggle(tmp_path) -> None:
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    _write_fake_export(export_dir, width_chunks=9)
+
+    base_dataset = TerrainRepairDataset(
+        export_dir,
+        tile_size=128,
+        mask_mode="rectangle",
+        seed=7,
+        cache_arrays=False,
+        augment=False,
+    )
+    base_a = base_dataset[0]
+    base_b = base_dataset[0]
+    assert torch.equal(base_a["target_height"], base_b["target_height"])
+    assert torch.equal(base_a["target_material"], base_b["target_material"])
+    assert torch.equal(base_a["mask"], base_b["mask"])
+
+    augmented_dataset = TerrainRepairDataset(
+        export_dir,
+        tile_size=128,
+        mask_mode="rectangle",
+        seed=7,
+        cache_arrays=False,
+        augment=True,
+    )
+    aug_a = augmented_dataset[0]["target_height"]
+    aug_b = augmented_dataset[0]["target_height"]
+    assert torch.equal(aug_a, aug_b)
+    augmented_dataset.set_mask_epoch(1)
+    aug_epoch_one = augmented_dataset[0]["target_height"]
+    assert not torch.equal(aug_a, aug_epoch_one)
+    sample = augmented_dataset[0]
+    assert sample["prefill_gradients"].shape == (2, 128, 128)
+    assert sample["prefill_laplacian"].shape == (1, 128, 128)
+    assert torch.allclose(
+        sample["prefill_height"] * (1.0 - sample["mask"]),
+        sample["target_height"] * (1.0 - sample["mask"]),
+    )
+
+
 def test_repair_dataset_keeps_multi_export_windows_separate(tmp_path) -> None:
     export_a = tmp_path / "export_a"
     export_b = tmp_path / "export_b"
@@ -192,6 +234,41 @@ def test_repair_model_training_and_checkpoint_roundtrip(tmp_path) -> None:
         load_repair_checkpoint(bad_checkpoint, reloaded)
 
 
+def test_repair_model_dropout_train_vs_eval(tmp_path) -> None:
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    _write_fake_export(export_dir, width_chunks=9)
+    dataset = TerrainRepairDataset(export_dir, tile_size=128, mask_mode="rectangle", seed=3)
+    batch = _batch_from_sample(dataset[0])
+
+    model = TerrainRepairUNet(num_material_classes=dataset.num_material_classes, dropout=0.1)
+    model.train()
+    torch.manual_seed(0)
+    train_out = model(
+        known_height=batch["known_height"],
+        prefill_height=batch["prefill_height"],
+        mask=batch["mask"],
+        known_material=batch["known_material"],
+        known_support=batch["known_support"],
+        boundary_distance=batch["boundary_distance"],
+        prefill_gradients=batch["prefill_gradients"],
+        prefill_laplacian=batch["prefill_laplacian"],
+    )
+    model.eval()
+    torch.manual_seed(0)
+    eval_out = model(
+        known_height=batch["known_height"],
+        prefill_height=batch["prefill_height"],
+        mask=batch["mask"],
+        known_material=batch["known_material"],
+        known_support=batch["known_support"],
+        boundary_distance=batch["boundary_distance"],
+        prefill_gradients=batch["prefill_gradients"],
+        prefill_laplacian=batch["prefill_laplacian"],
+    )
+    assert not torch.allclose(train_out.height_residual, eval_out.height_residual)
+
+
 def test_lightning_module_training_step(tmp_path) -> None:
     export_dir = tmp_path / "export"
     export_dir.mkdir()
@@ -202,6 +279,7 @@ def test_lightning_module_training_step(tmp_path) -> None:
         tile_size=128,
         stride_chunks=1,
         mask_mode="rectangle",
+        augment=False,
         batch_size=1,
         num_workers=0,
     )
@@ -214,6 +292,75 @@ def test_lightning_module_training_step(tmp_path) -> None:
 
     assert torch.isfinite(loss)
     assert loss.item() > 0
+
+
+def test_lightning_optimizer_uses_weight_decay(tmp_path) -> None:
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    _write_fake_export(export_dir, width_chunks=8, height_chunks=8)
+    dataset = TerrainRepairDataset(export_dir, tile_size=128, mask_mode="rectangle")
+    module = TerrainRepairLightningModule(
+        num_material_classes=dataset.num_material_classes,
+        weight_decay=0.123,
+        dropout=0.1,
+    )
+    optimizer = module.configure_optimizers()
+    assert isinstance(optimizer, torch.optim.AdamW)
+    assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.123)
+
+
+def test_repair_onnx_export_roundtrip(tmp_path) -> None:
+    pytest.importorskip("onnx")
+    pytest.importorskip("onnxruntime")
+    from unet.repair_onnx import export_repair_onnx
+
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    _write_fake_export(export_dir, width_chunks=8, height_chunks=8)
+    dataset = TerrainRepairDataset(export_dir, tile_size=128, mask_mode="rectangle", seed=1)
+    batch = _batch_from_sample(dataset[0])
+
+    model = TerrainRepairUNet(num_material_classes=dataset.num_material_classes, dropout=0.0)
+    checkpoint = tmp_path / "repair.pt"
+    save_repair_checkpoint(
+        checkpoint,
+        model,
+        optimizer=None,
+        meta={"model_type": "deterministic_repair_v2", "height_min": 0.0, "height_max": 128.0},
+    )
+
+    onnx_path = tmp_path / "repair.onnx"
+    export_repair_onnx(checkpoint, onnx_path, tile_size=128, verify=True)
+    assert onnx_path.is_file()
+    assert onnx_path.with_suffix(".json").is_file()
+
+
+def test_checkpoint_meta_includes_regularization_fields(tmp_path) -> None:
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    _write_fake_export(export_dir, width_chunks=8, height_chunks=8)
+    dataset = TerrainRepairDataset(export_dir, tile_size=128, mask_mode="rectangle")
+    args = type("Args", (), {
+        "tile_size": 128,
+        "stride_chunks": 1,
+        "export_dir": [str(export_dir)],
+        "dropout": 0.1,
+        "weight_decay": 1e-2,
+        "augment": True,
+        "lr_scheduler": "cosine",
+        "learning_rate": 1e-4,
+    })()
+    meta = build_repair_checkpoint_meta(
+        args,
+        dataset,
+        RepairTrainingState(completed_epochs=1, global_step=7),
+        interrupted=False,
+    )
+    assert meta["dropout"] == pytest.approx(0.1)
+    assert meta["weight_decay"] == pytest.approx(1e-2)
+    assert meta["augment"] is True
+    assert meta["lr_scheduler"] == "cosine"
+    assert meta["learning_rate"] == pytest.approx(1e-4)
 
 
 def test_repair_inference_outputs_and_preserves_known_pixels(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -28,6 +28,11 @@ EPOCHS ?= 1
 BATCH_SIZE ?= 2
 LEARNING_RATE ?= 1e-4
 LR_SCHEDULER ?= none
+WEIGHT_DECAY ?= 1e-2
+DROPOUT ?= 0.0
+AUGMENT ?=
+EARLY_STOPPING_PATIENCE ?= 0
+EARLY_STOPPING_MIN_DELTA ?= 0.001
 MODEL_BASE_CHANNELS ?= 64
 MODEL_DEPTH ?= 4
 MODEL_BOTTLENECK_DILATIONS ?= 1,2,4,2
@@ -67,8 +72,11 @@ MASK_TOP ?= 48
 MASK_LEFT ?= 48
 MASK_HEIGHT ?= 32
 MASK_WIDTH ?= 32
+REPAIR_ONNX ?= ./artifacts/repair.onnx
+ONNX_TILE_SIZE ?= 128
+ONNX_OPSET ?= 17
 
-.PHONY: help sync test export visualize analyze-variance train train-lightning train-legacy prepare-infer infer repair repair-case infer-gui view-repair generate-figures
+.PHONY: help sync test export visualize analyze-variance train train-lightning train-legacy export-onnx prepare-infer infer repair repair-case infer-gui view-repair generate-figures
 
 help:
 	@printf "Targets:\n"
@@ -78,9 +86,12 @@ help:
 	@printf "  make visualize [OUT=./data/exports]            Render export validation images\n"
 	@printf "  make analyze-variance [OUT=...]                Report height/material variance balance\n"
 	@printf "  make train [OUT=...] [EPOCHS=...] [BATCH_SIZE=...] [LIGHTNING_DEVICES=1] [AMP=auto|off|fp16|bf16]\n"
-	@printf "            PyTorch Lightning + LitLogger; optional: [LITLOGGER_NAME=...] [LITLOGGER_TEAMSPACE=user/ts]\n"
-	@printf "            [LITLOGGER_ROOT=path] [LITLOGGER_METADATA='k=v'] [LITLOGGER_LOG_MODEL=1]\n"
+	@printf "            PyTorch Lightning + LitLogger; optional: [LR_SCHEDULER=cosine] [DROPOUT=0.1] [AUGMENT=1]\n"
+	@printf "            [WEIGHT_DECAY=1e-2] [EARLY_STOPPING_PATIENCE=25] [SAVE_EVERY=5] [VALIDATE_EVERY=5]\n"
+	@printf "            [LITLOGGER_NAME=...] [LITLOGGER_TEAMSPACE=user/ts] [LITLOGGER_ROOT=path]\n"
+	@printf "            [LITLOGGER_METADATA='k=v'] [LITLOGGER_LOG_MODEL=1]\n"
 	@printf "  make train-legacy …                            Plain PyTorch loop + optional TensorBoard\n"
+	@printf "  make export-onnx [REPAIR_CHECKPOINT=...]       Export repair.pt to ONNX (+ JSON metadata for plugins)\n"
 	@printf "  make prepare-infer [ORIGIN_CHUNK_X=...]        Build known_height/material/mask from exported chunks\n"
 	@printf "  make infer [REPAIR_CHECKPOINT=...] [INPUTS=...] Run U-Net repair on prepared scratch inputs\n"
 	@printf "  make repair [REPAIR_CHECKPOINT=...] [REPAIR_CASES=...] Run shared deterministic repair cases\n"
@@ -123,6 +134,10 @@ train:
 		--grad-accum-steps $(GRAD_ACCUM_STEPS) \
 		--learning-rate $(LEARNING_RATE) \
 		--lr-scheduler "$(LR_SCHEDULER)" \
+		--weight-decay $(WEIGHT_DECAY) \
+		--dropout $(DROPOUT) \
+		$(if $(AUGMENT),--augment,) \
+		$(if $(filter-out 0,$(EARLY_STOPPING_PATIENCE)),--early-stopping-patience $(EARLY_STOPPING_PATIENCE) --early-stopping-min-delta $(EARLY_STOPPING_MIN_DELTA),) \
 		--model-base-channels $(MODEL_BASE_CHANNELS) \
 		--model-depth $(MODEL_DEPTH) \
 		--model-bottleneck-dilations "$(MODEL_BOTTLENECK_DILATIONS)" \
@@ -154,6 +169,13 @@ train:
 		$(if $(LIGHTNING_CKPT),--ckpt-path "$(LIGHTNING_CKPT)",)
 
 train-lightning: train
+
+export-onnx:
+	uv run --package mc-terrain-unet python scripts/export_repair_onnx.py \
+		--checkpoint "$(REPAIR_CHECKPOINT)" \
+		--output "$(REPAIR_ONNX)" \
+		--tile-size $(ONNX_TILE_SIZE) \
+		--opset $(ONNX_OPSET)
 
 train-legacy:
 	uv run --package mc-terrain-unet python -m unet.repair_training --export-dir "$(OUT)" --checkpoint "$(REPAIR_CHECKPOINT)" --latest-checkpoint "$(REPAIR_LATEST_CHECKPOINT)" --best-checkpoint "$(REPAIR_BEST_CHECKPOINT)" --epochs $(EPOCHS) --save-every $(SAVE_EVERY) --batch-size $(BATCH_SIZE) --grad-accum-steps $(GRAD_ACCUM_STEPS) --learning-rate $(LEARNING_RATE) --model-base-channels $(MODEL_BASE_CHANNELS) --model-depth $(MODEL_DEPTH) --model-bottleneck-dilations "$(MODEL_BOTTLENECK_DILATIONS)" --tile-size $(TRAIN_TILE_SIZE) --stride-chunks $(STRIDE_CHUNKS) --mask-mode "$(REPAIR_MASK_MODE)" --device "$(DEVICE)" --amp "$(AMP)" --num-workers $(NUM_WORKERS) --grad-clip-norm $(GRAD_CLIP_NORM) --validation-cases-dir "$(REPAIR_CASES)" --validate-every $(VALIDATE_EVERY) --tf32 "$(TF32)" $(if $(TENSORBOARD),--tensorboard-dir "$(TENSORBOARD_DIR)",) $(if $(COMPILE),--compile,) $(if $(CHANNELS_LAST),--channels-last,) $(if $(RESUME),--resume "$(RESUME)",)

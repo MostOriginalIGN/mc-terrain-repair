@@ -19,7 +19,7 @@ from typing import Any
 
 import lightning.pytorch as pl
 from lightning.fabric.utilities.rank_zero import rank_zero_only
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import LitLogger
 import torch
 from torch import Tensor
@@ -94,10 +94,12 @@ class TerrainRepairLightningModule(pl.LightningModule):
         num_material_classes: int,
         learning_rate: float = 1e-4,
         lr_scheduler: str = "none",
+        weight_decay: float = 1e-2,
         channels_last: bool = False,
         model_base_channels: int = 64,
         model_depth: int = 4,
         model_bottleneck_dilations: str = "1,2,4,2",
+        dropout: float = 0.0,
         weights: RepairLossWeights = RepairLossWeights(),
     ):
         super().__init__()
@@ -105,10 +107,12 @@ class TerrainRepairLightningModule(pl.LightningModule):
             "num_material_classes": num_material_classes,
             "learning_rate": learning_rate,
             "lr_scheduler": lr_scheduler,
+            "weight_decay": weight_decay,
             "channels_last": channels_last,
             "model_base_channels": model_base_channels,
             "model_depth": model_depth,
             "model_bottleneck_dilations": model_bottleneck_dilations,
+            "dropout": dropout,
             "loss_weights": {
                 "height": weights.height,
                 "edge_height": weights.edge_height,
@@ -123,9 +127,11 @@ class TerrainRepairLightningModule(pl.LightningModule):
             base_channels=model_base_channels,
             depth=model_depth,
             bottleneck_dilations=model_bottleneck_dilations,
+            dropout=dropout,
         )
         self.learning_rate = learning_rate
         self.lr_scheduler = lr_scheduler
+        self.weight_decay = float(weight_decay)
         self.channels_last = channels_last
         self.weights = weights
         if channels_last:
@@ -168,7 +174,7 @@ class TerrainRepairLightningModule(pl.LightningModule):
         return losses.total_loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
         if self.lr_scheduler == "none":
             return optimizer
         if self.lr_scheduler != "cosine":
@@ -190,6 +196,7 @@ class TerrainRepairDataModule(pl.LightningDataModule):
         tile_size: int,
         stride_chunks: int,
         mask_mode: str,
+        augment: bool,
         batch_size: int,
         num_workers: int,
         prefetch_factor: int | None = 4,
@@ -200,6 +207,7 @@ class TerrainRepairDataModule(pl.LightningDataModule):
         self.tile_size = tile_size
         self.stride_chunks = stride_chunks
         self.mask_mode = mask_mode
+        self.augment = bool(augment)
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.prefetch_factor = prefetch_factor
@@ -213,6 +221,7 @@ class TerrainRepairDataModule(pl.LightningDataModule):
                 tile_size=self.tile_size,
                 stride_chunks=self.stride_chunks,
                 mask_mode=self.mask_mode,
+                augment=self.augment,
                 prefill_iterations=self.prefill_iterations,
             )
 
@@ -367,6 +376,7 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--lr-scheduler", default="none", choices=["none", "cosine"],
                         help="Learning-rate schedule. Default preserves the legacy constant LR behavior.")
+    parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--model-base-channels", type=int, default=64)
     parser.add_argument("--model-depth", type=int, default=4)
@@ -375,10 +385,14 @@ def main() -> None:
         default="1,2,4,2",
         help="Comma-separated dilation rates for bottleneck residual blocks. Empty disables extra dilated blocks.",
     )
+    parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--tile-size", type=int, default=128)
     parser.add_argument("--stride-chunks", type=int, default=1)
     parser.add_argument("--mask-mode", default="selection_mixed",
                         choices=["none", "rectangle", "strip", "blob", "mixed", "terrain_mixed", "selection_mixed"])
+    parser.add_argument("--augment", action="store_true", help="Enable random flip/rot90 spatial augmentation.")
+    parser.add_argument("--early-stopping-patience", type=int, default=0)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=0.001)
 
     parser.add_argument("--amp", default="auto", choices=["auto", "off", "fp16", "bf16"])
     parser.add_argument("--precision", default=None,
@@ -425,6 +439,9 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if args.early_stopping_patience > 0 and args.validation_cases_dir is None:
+        raise SystemExit("--early-stopping-patience requires --validation-cases-dir so val/score can be monitored.")
+
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision(args.matmul_precision)
     configure_cuda_backend(
@@ -440,6 +457,7 @@ def main() -> None:
         tile_size=args.tile_size,
         stride_chunks=args.stride_chunks,
         mask_mode=args.mask_mode,
+        augment=args.augment,
         batch_size=args.batch_size,
         num_workers=num_workers,
         prefetch_factor=args.prefetch_factor,
@@ -452,10 +470,12 @@ def main() -> None:
         num_material_classes=datamodule.dataset.num_material_classes,
         learning_rate=args.learning_rate,
         lr_scheduler=args.lr_scheduler,
+        weight_decay=args.weight_decay,
         channels_last=args.channels_last,
         model_base_channels=args.model_base_channels,
         model_depth=args.model_depth,
         model_bottleneck_dilations=args.model_bottleneck_dilations,
+        dropout=args.dropout,
     )
     if args.resume is not None:
         load_repair_checkpoint(args.resume, module.model, map_location="cpu")
@@ -529,6 +549,23 @@ def main() -> None:
         f"teamspace={args.litlogger_teamspace!r} log_model={args.litlogger_log_model}"
     )
 
+    callbacks: list[pl.Callback] = [
+        RepairEpochCallback(),
+        validation_callback,
+    ]
+    if args.early_stopping_patience > 0:
+        callbacks.append(EarlyStopping(
+            monitor="val/score",
+            mode="min",
+            patience=args.early_stopping_patience,
+            min_delta=args.early_stopping_min_delta,
+        ))
+    callbacks.extend([
+        compatible_checkpoint,
+        lightning_checkpoint,
+        LearningRateMonitor(logging_interval="step"),
+    ])
+
     trainer = pl.Trainer(
         accelerator=args.accelerator,
         devices=args.devices,
@@ -537,13 +574,7 @@ def main() -> None:
         precision=precision,
         max_epochs=args.epochs,
         logger=lit_logger,
-        callbacks=[
-            RepairEpochCallback(),
-            validation_callback,
-            compatible_checkpoint,
-            lightning_checkpoint,
-            LearningRateMonitor(logging_interval="step"),
-        ],
+        callbacks=callbacks,
         accumulate_grad_batches=max(1, args.grad_accum_steps),
         gradient_clip_val=args.grad_clip_norm if args.grad_clip_norm > 0 else None,
         benchmark=args.cudnn_benchmark,

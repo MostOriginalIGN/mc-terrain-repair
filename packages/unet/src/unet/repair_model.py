@@ -82,6 +82,7 @@ class TerrainRepairUNet(nn.Module):
         base_channels: int = 64,
         depth: int = 4,
         bottleneck_dilations: str | tuple[int, ...] | list[int] | None = None,
+        dropout: float = 0.0,
     ):
         super().__init__()
         if depth < 1:
@@ -89,6 +90,7 @@ class TerrainRepairUNet(nn.Module):
         self.num_material_classes = num_material_classes
         self.base_channels = base_channels
         self.depth = depth
+        self.dropout = float(dropout)
         self.bottleneck_dilations = _parse_bottleneck_dilations(bottleneck_dilations)
         scalar_channels = 1 + 1 + 1 + 1 + 2 + 1 + 1
         in_channels = scalar_channels + num_material_classes
@@ -97,11 +99,14 @@ class TerrainRepairUNet(nn.Module):
 
         encoder_channels = [base_channels * (2 ** max(0, level - 1)) for level in range(depth)]
         downs: list[nn.Module] = []
+        down_dropouts: list[nn.Module] = []
         current_channels = base_channels
         for out_channels in encoder_channels:
             downs.append(RepairDownBlock(current_channels, out_channels))
+            down_dropouts.append(nn.Dropout2d(self.dropout) if self.dropout > 0 else nn.Identity())
             current_channels = out_channels
         self.downs = nn.ModuleList(downs)
+        self.down_dropouts = nn.ModuleList(down_dropouts)
 
         mid_blocks: list[nn.Module] = [RepairResBlock(current_channels, current_channels)]
         mid_blocks.extend(
@@ -109,6 +114,7 @@ class TerrainRepairUNet(nn.Module):
             for dilation in self.bottleneck_dilations
         )
         self.mid = nn.Sequential(*mid_blocks)
+        self.mid_dropout = nn.Dropout2d(self.dropout) if self.dropout > 0 else nn.Identity()
 
         ups: list[nn.Module] = []
         for index, skip_channels in enumerate(reversed(encoder_channels)):
@@ -118,6 +124,7 @@ class TerrainRepairUNet(nn.Module):
         self.ups = nn.ModuleList(ups)
 
         self.out_norm = nn.GroupNorm(8, base_channels)
+        self.out_dropout = nn.Dropout2d(self.dropout) if self.dropout > 0 else nn.Identity()
         self.height_head = nn.Conv2d(base_channels, 1, kernel_size=3, padding=1)
         self.material_head = nn.Conv2d(base_channels, num_material_classes, kernel_size=1)
         self.support_head = nn.Conv2d(base_channels, 1, kernel_size=3, padding=1)
@@ -128,6 +135,7 @@ class TerrainRepairUNet(nn.Module):
             "model_base_channels": self.base_channels,
             "model_depth": self.depth,
             "model_bottleneck_dilations": ",".join(str(dilation) for dilation in self.bottleneck_dilations),
+            "model_dropout": self.dropout,
         }
 
     def forward(
@@ -163,13 +171,16 @@ class TerrainRepairUNet(nn.Module):
         )
         x = self.input_proj(x)
         skips = []
-        for down in self.downs:
+        for down, dropout in zip(self.downs, self.down_dropouts, strict=True):
             skip, x = down(x)
+            x = dropout(x)
             skips.append(skip)
         x = self.mid(x)
+        x = self.mid_dropout(x)
         for up, skip in zip(self.ups, reversed(skips), strict=True):
             x = up(x, skip)
         x = F.silu(self.out_norm(x))
+        x = self.out_dropout(x)
 
         return TerrainRepairOutput(
             height_residual=self.height_head(x),
