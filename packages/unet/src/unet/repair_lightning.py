@@ -20,7 +20,7 @@ from typing import Any
 import lightning.pytorch as pl
 from lightning.fabric.utilities.rank_zero import rank_zero_only
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
-from lightning.pytorch.loggers import LitLogger
+from lightning.pytorch.loggers import CSVLogger, LitLogger
 import torch
 from torch import Tensor
 from torch.nn import Module
@@ -29,14 +29,20 @@ from torch.utils.data import DataLoader
 from unet.repair_data import TerrainRepairDataset
 from unet.repair_model import TerrainRepairUNet
 from unet.repair_training import (
+    RepairAmpConfig,
+    RepairLossOutput,
     RepairLossWeights,
     RepairTrainingState,
+    add_repair_loss_weight_args,
     build_repair_checkpoint_meta,
     checkpoint_sibling,
+    configure_training_seed,
     compute_repair_losses,
     configure_cuda_backend,
     evaluate_repair_cases,
     load_repair_checkpoint,
+    print_validation_overlap_warnings,
+    repair_loss_weights_from_args,
     resolve_training_export_dirs,
     save_repair_checkpoint,
 )
@@ -88,6 +94,104 @@ def _precision_from_amp(amp: str) -> str:
         return "16-mixed"
     return "32-true"
 
+
+def _loss_weights_hparams(weights: RepairLossWeights) -> dict[str, float]:
+    return {
+        "height": weights.height,
+        "edge_height": weights.edge_height,
+        "gradient": weights.gradient,
+        "seam": weights.seam,
+        "laplacian": weights.laplacian,
+        "highpass": weights.highpass,
+        "roughness": weights.roughness,
+        "context": weights.context,
+        "material": weights.material,
+        "support": weights.support,
+    }
+
+
+def _log_loss_metrics(
+    module: pl.LightningModule,
+    prefix: str,
+    losses: RepairLossOutput,
+    *,
+    batch_size: int,
+    on_step: bool,
+    on_epoch: bool,
+) -> None:
+    total_name = "score" if prefix == "val_window" else "total_loss"
+    entries = (
+        (total_name, "total_loss"),
+        ("height_loss", "height_loss"),
+        ("height_mae_blocks", "height_mae_blocks"),
+        ("height_within_1_block", "height_within_1_block"),
+        ("height_within_2_blocks", "height_within_2_blocks"),
+        ("edge_height_loss", "edge_height_loss"),
+        ("gradient_loss", "gradient_loss"),
+        ("gradient_mae_blocks", "gradient_mae_blocks"),
+        ("seam_loss", "seam_loss"),
+        ("laplacian_loss", "laplacian_loss"),
+        ("highpass_loss", "highpass_loss"),
+        ("roughness_loss", "roughness_loss"),
+        ("context_loss", "context_loss"),
+        ("material_loss", "material_loss"),
+        ("support_loss", "support_loss"),
+    )
+    for metric_name, attribute in entries:
+        module.log(
+            f"{prefix}/{metric_name}",
+            getattr(losses, attribute),
+            on_step=on_step,
+            on_epoch=on_epoch,
+            prog_bar=metric_name == total_name or (prefix == "val_window" and metric_name == "height_mae_blocks"),
+            batch_size=batch_size,
+        )
+
+
+def split_spatial_window_indices(
+    dataset: TerrainRepairDataset,
+    val_fraction: float,
+    buffer_chunks: int,
+) -> tuple[list[int], list[int]]:
+    """Split windows by a held-out spatial slab with a buffer to avoid overlap leakage."""
+    if val_fraction <= 0.0:
+        return list(range(len(dataset))), []
+    val_fraction = min(max(float(val_fraction), 0.0), 0.5)
+    buffer_chunks = max(0, int(buffer_chunks))
+    train_indices: list[int] = []
+    val_indices: list[int] = []
+    grouped: dict[int, list[tuple[int, tuple[int, int]]]] = {}
+    for index, (export_id, origin) in enumerate(zip(dataset.window_export_ids, dataset.window_origins, strict=True)):
+        grouped.setdefault(int(export_id), []).append((index, origin))
+
+    for group in grouped.values():
+        if len(group) < 2:
+            train_indices.extend(index for index, _ in group)
+            continue
+        xs = [origin[0] for _, origin in group]
+        zs = [origin[1] for _, origin in group]
+        axis = 0 if max(xs) - min(xs) >= max(zs) - min(zs) else 1
+        sorted_origins = sorted({origin[axis] for _, origin in group})
+        split_position = max(1, min(len(sorted_origins) - 1, int(round(len(sorted_origins) * (1.0 - val_fraction)))))
+        val_start = sorted_origins[split_position]
+        train_limit = val_start - dataset.chunks_per_side - buffer_chunks + 1
+
+        group_train = [index for index, origin in group if origin[axis] < train_limit]
+        group_val = [index for index, origin in group if origin[axis] >= val_start]
+        if not group_train or not group_val:
+            train_indices.extend(index for index, _ in group)
+            continue
+        train_indices.extend(group_train)
+        val_indices.extend(group_val)
+
+    return sorted(train_indices), sorted(val_indices)
+
+
+def _apply_window_subset(dataset: TerrainRepairDataset, indices: list[int]) -> None:
+    dataset.window_origins = [dataset.window_origins[index] for index in indices]
+    dataset.window_export_ids = [dataset.window_export_ids[index] for index in indices]
+
+
 class TerrainRepairLightningModule(pl.LightningModule):
     def __init__(
         self,
@@ -113,14 +217,7 @@ class TerrainRepairLightningModule(pl.LightningModule):
             "model_depth": model_depth,
             "model_bottleneck_dilations": model_bottleneck_dilations,
             "dropout": dropout,
-            "loss_weights": {
-                "height": weights.height,
-                "edge_height": weights.edge_height,
-                "gradient": weights.gradient,
-                "seam": weights.seam,
-                "material": weights.material,
-                "support": weights.support,
-            },
+            "loss_weights": _loss_weights_hparams(weights),
         })
         self.model = TerrainRepairUNet(
             num_material_classes=num_material_classes,
@@ -164,13 +261,14 @@ class TerrainRepairLightningModule(pl.LightningModule):
         losses = compute_repair_losses(self.model, batch, weights=self.weights)
         batch_size = batch["target_height"].shape[0]
         if getattr(self, "_trainer", None) is not None:
-            self.log("train/total_loss", losses.total_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
-            self.log("train/height_loss", losses.height_loss, on_step=True, on_epoch=True, batch_size=batch_size)
-            self.log("train/edge_height_loss", losses.edge_height_loss, on_step=True, on_epoch=True, batch_size=batch_size)
-            self.log("train/gradient_loss", losses.gradient_loss, on_step=True, on_epoch=True, batch_size=batch_size)
-            self.log("train/seam_loss", losses.seam_loss, on_step=True, on_epoch=True, batch_size=batch_size)
-            self.log("train/material_loss", losses.material_loss, on_step=True, on_epoch=True, batch_size=batch_size)
-            self.log("train/support_loss", losses.support_loss, on_step=True, on_epoch=True, batch_size=batch_size)
+            _log_loss_metrics(self, "train", losses, batch_size=batch_size, on_step=True, on_epoch=True)
+        return losses.total_loss
+
+    def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        batch = _format_repair_batch(batch, self.channels_last)
+        losses = compute_repair_losses(self.model, batch, weights=self.weights)
+        batch_size = batch["target_height"].shape[0]
+        _log_loss_metrics(self, "val_window", losses, batch_size=batch_size, on_step=False, on_epoch=True)
         return losses.total_loss
 
     def configure_optimizers(self):
@@ -201,6 +299,10 @@ class TerrainRepairDataModule(pl.LightningDataModule):
         num_workers: int,
         prefetch_factor: int | None = 4,
         prefill_iterations: int = 64,
+        seed: int = 0,
+        val_split: str = "spatial",
+        val_fraction: float = 0.1,
+        val_buffer_chunks: int = 8,
     ):
         super().__init__()
         self.export_dirs = export_dirs
@@ -212,18 +314,50 @@ class TerrainRepairDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.prefetch_factor = prefetch_factor
         self.prefill_iterations = prefill_iterations
+        self.seed = int(seed)
+        self.val_split = val_split
+        self.val_fraction = float(val_fraction)
+        self.val_buffer_chunks = int(val_buffer_chunks)
         self.dataset: TerrainRepairDataset | None = None
+        self.val_dataset: TerrainRepairDataset | None = None
+        self.dropped_buffer_windows = 0
 
     def setup(self, stage: str | None = None) -> None:
         if self.dataset is None:
-            self.dataset = TerrainRepairDataset(
+            full_dataset = TerrainRepairDataset(
                 self.export_dirs,
                 tile_size=self.tile_size,
                 stride_chunks=self.stride_chunks,
                 mask_mode=self.mask_mode,
                 augment=self.augment,
+                seed=self.seed,
                 prefill_iterations=self.prefill_iterations,
             )
+            if self.val_split == "spatial":
+                all_count = len(full_dataset)
+                train_indices, val_indices = split_spatial_window_indices(
+                    full_dataset,
+                    val_fraction=self.val_fraction,
+                    buffer_chunks=self.val_buffer_chunks,
+                )
+                self.dropped_buffer_windows = all_count - len(train_indices) - len(val_indices)
+                _apply_window_subset(full_dataset, train_indices)
+                self.dataset = full_dataset
+                if val_indices:
+                    self.val_dataset = TerrainRepairDataset(
+                        self.export_dirs,
+                        tile_size=self.tile_size,
+                        stride_chunks=self.stride_chunks,
+                        mask_mode=self.mask_mode,
+                        augment=False,
+                        seed=self.seed + 10_000,
+                        cache_arrays=False,
+                        height_range=(full_dataset.height_min, full_dataset.height_max),
+                        prefill_iterations=self.prefill_iterations,
+                    )
+                    _apply_window_subset(self.val_dataset, val_indices)
+            else:
+                self.dataset = full_dataset
 
     def train_dataloader(self) -> DataLoader:
         if self.dataset is None:
@@ -235,10 +369,27 @@ class TerrainRepairDataModule(pl.LightningDataModule):
             "num_workers": self.num_workers,
             "pin_memory": torch.cuda.is_available(),
             "persistent_workers": self.num_workers > 0,
+            "generator": torch.Generator().manual_seed(self.seed),
         }
         if self.num_workers > 0:
             loader_kwargs["prefetch_factor"] = self.prefetch_factor or 2
         return DataLoader(self.dataset, **loader_kwargs)
+
+    def val_dataloader(self) -> DataLoader | None:
+        if self.dataset is None:
+            self.setup("fit")
+        if self.val_dataset is None or len(self.val_dataset) == 0:
+            return None
+        loader_kwargs: dict[str, Any] = {
+            "batch_size": self.batch_size,
+            "shuffle": False,
+            "num_workers": self.num_workers,
+            "pin_memory": torch.cuda.is_available(),
+            "persistent_workers": self.num_workers > 0,
+        }
+        if self.num_workers > 0:
+            loader_kwargs["prefetch_factor"] = self.prefetch_factor or 2
+        return DataLoader(self.val_dataset, **loader_kwargs)
 
 class RepairEpochCallback(pl.Callback):
     """Advance the dataset's mask epoch counter at the start of each training epoch."""
@@ -273,12 +424,11 @@ class RepairValidationCaseCallback(pl.Callback):
         else:
             amp_dtype = None
 
-        AmpConfig = type("AmpConfig", (), {"enabled": amp_dtype is not None, "dtype": amp_dtype})
         metrics = evaluate_repair_cases(
             pl_module.model,
             self.cases_dir,
             device=pl_module.device,
-            amp_config=AmpConfig(),
+            amp_config=RepairAmpConfig(enabled=amp_dtype is not None, dtype=amp_dtype),
             channels_last=self.channels_last,
         )
         if metrics is None:
@@ -286,14 +436,36 @@ class RepairValidationCaseCallback(pl.Callback):
 
         self.best_score = min(self.best_score, metrics.score)
         pl_module.log("val/score",             metrics.score,             sync_dist=False)
+        pl_module.log("val/visual_score",      metrics.visual_score,      sync_dist=False)
+        pl_module.log("val/legacy_score",      metrics.legacy_score,      sync_dist=False)
         pl_module.log("val/height_mae",        metrics.height_mae,        sync_dist=False)
+        pl_module.log("val/height_mae_blocks", metrics.height_mae_blocks, sync_dist=False)
+        pl_module.log("val/height_within_1_block", metrics.height_within_1_block, sync_dist=False)
+        pl_module.log("val/height_within_2_blocks", metrics.height_within_2_blocks, sync_dist=False)
         pl_module.log("val/seam_mae",          metrics.seam_mae,          sync_dist=False)
+        pl_module.log("val/seam_mae_blocks",   metrics.seam_mae_blocks,   sync_dist=False)
+        pl_module.log("val/gradient_mae",      metrics.gradient_mae,      sync_dist=False)
+        pl_module.log("val/gradient_mae_blocks", metrics.gradient_mae_blocks, sync_dist=False)
+        pl_module.log("val/laplacian_mae",     metrics.laplacian_mae,     sync_dist=False)
+        pl_module.log("val/laplacian_mae_blocks", metrics.laplacian_mae_blocks, sync_dist=False)
+        pl_module.log("val/highpass_mae",      metrics.highpass_mae,      sync_dist=False)
+        pl_module.log("val/highpass_mae_blocks", metrics.highpass_mae_blocks, sync_dist=False)
+        pl_module.log("val/roughness_ratio",   metrics.roughness_ratio,   sync_dist=False)
+        pl_module.log("val/context_style_error_blocks", metrics.context_style_error_blocks, sync_dist=False)
+        pl_module.log("val/context_roughness_ratio", metrics.context_roughness_ratio, sync_dist=False)
+        pl_module.log("val/context_laplacian_ratio", metrics.context_laplacian_ratio, sync_dist=False)
+        pl_module.log("val/context_highpass_ratio", metrics.context_highpass_ratio, sync_dist=False)
         pl_module.log("val/material_accuracy", metrics.material_accuracy,  sync_dist=False)
         pl_module.log("val/support_mse",       metrics.support_mse,       sync_dist=False)
         print(
-            f"repair validation: score={metrics.score:.4f} height_mae={metrics.height_mae:.4f} "
-            f"seam_mae={metrics.seam_mae:.4f} material_acc={metrics.material_accuracy:.4f} "
-            f"support_mse={metrics.support_mse:.4f} cases={metrics.case_count}"
+            f"repair validation: visual_score={metrics.visual_score:.4f} legacy_score={metrics.legacy_score:.4f} "
+            f"height_blocks={metrics.height_mae_blocks:.3f} within1={metrics.height_within_1_block:.3f} "
+            f"within2={metrics.height_within_2_blocks:.3f} seam_blocks={metrics.seam_mae_blocks:.3f} "
+            f"grad_blocks={metrics.gradient_mae_blocks:.3f} lap_blocks={metrics.laplacian_mae_blocks:.3f} "
+            f"highpass_blocks={metrics.highpass_mae_blocks:.3f} roughness_ratio={metrics.roughness_ratio:.3f} "
+            f"context_blocks={metrics.context_style_error_blocks:.3f} context_rough={metrics.context_roughness_ratio:.3f} "
+            f"material_acc={metrics.material_accuracy:.4f} support_mse={metrics.support_mse:.4f} "
+            f"cases={metrics.case_count} mask_pixels={metrics.mask_pixel_count}"
         )
 
 
@@ -319,6 +491,14 @@ class RepairCompatibleCheckpointCallback(pl.Callback):
         self.save_every = save_every
         self.best_score = float("inf")
 
+    def _current_score(self, trainer: pl.Trainer) -> float:
+        if self.validation_callback.best_score < float("inf"):
+            return self.validation_callback.best_score
+        val_window_score = trainer.callback_metrics.get("val_window/score")
+        if isinstance(val_window_score, torch.Tensor) and torch.isfinite(val_window_score):
+            return float(val_window_score.detach().cpu())
+        return float("inf")
+
     def _save(
         self,
         path: Path,
@@ -334,7 +514,8 @@ class RepairCompatibleCheckpointCallback(pl.Callback):
             completed_epochs=trainer.current_epoch if completed_epochs is None else completed_epochs,
             global_step=trainer.global_step,
         )
-        export_args = argparse.Namespace(**vars(self.args), best_score=self.validation_callback.best_score)
+        score = self._current_score(trainer)
+        export_args = argparse.Namespace(**vars(self.args), best_score=score if score < float("inf") else None)
         optimizer = trainer.optimizers[0] if trainer.optimizers else None
         meta = build_repair_checkpoint_meta(export_args, dataset, state, interrupted=interrupted)
         meta["trainer"] = "lightning"
@@ -351,8 +532,9 @@ class RepairCompatibleCheckpointCallback(pl.Callback):
         if self.latest_checkpoint_path != self.checkpoint_path:
             self._save(self.latest_checkpoint_path, trainer, pl_module, interrupted=False, completed_epochs=completed_epoch)
 
-        if self.validation_callback.best_score < self.best_score:
-            self.best_score = self.validation_callback.best_score
+        candidate_score = self._current_score(trainer)
+        if candidate_score < self.best_score:
+            self.best_score = candidate_score
             self._save(self.best_checkpoint_path, trainer, pl_module, interrupted=False, completed_epochs=completed_epoch)
 
     def on_exception(self, trainer: pl.Trainer, pl_module: TerrainRepairLightningModule, exception: BaseException) -> None:
@@ -374,6 +556,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--seed", type=int, default=0, help="Seed for masks, shuffling, workers, and model initialization.")
     parser.add_argument("--lr-scheduler", default="none", choices=["none", "cosine"],
                         help="Learning-rate schedule. Default preserves the legacy constant LR behavior.")
     parser.add_argument("--weight-decay", type=float, default=1e-2)
@@ -417,6 +600,8 @@ def main() -> None:
 
     parser.add_argument("--litlogger-root-dir", default=None,
                         help="Root directory for LitLogger local files (default: <lightning-root-dir>/litlogger).")
+    parser.add_argument("--logger", default="csv", choices=["csv", "litlogger", "none"],
+                        help="Training logger. Default csv is local/offline; litlogger requires Lightning credentials.")
     parser.add_argument("--litlogger-name", default=None,
                         help="Experiment name shown in the Lightning AI dashboard (default: auto-generated).")
     parser.add_argument("--litlogger-teamspace", default=None,
@@ -430,17 +615,28 @@ def main() -> None:
 
     parser.add_argument("--validation-cases-dir", default=None)
     parser.add_argument("--validate-every", type=int, default=1)
+    parser.add_argument("--val-split", default="spatial", choices=["none", "spatial"],
+                        help="Automatic train/validation split over export windows. Spatial uses a buffered held-out slab.")
+    parser.add_argument("--val-fraction", type=float, default=0.1,
+                        help="Fraction of discovered spatial window origins to hold out per export for --val-split=spatial.")
+    parser.add_argument("--val-buffer-chunks", type=int, default=8,
+                        help="Chunk gap between train and validation origin slabs for spatial split.")
+    add_repair_loss_weight_args(parser)
 
     parser.add_argument("--lightning-root-dir", default="./artifacts/lightning")
     parser.add_argument("--log-every-n-steps", type=int, default=10)
     parser.add_argument("--limit-train-batches", default=None,
                         help="Fraction (0–1) or absolute count of batches per epoch.")
+    parser.add_argument("--limit-val-batches", default=None,
+                        help="Fraction (0–1) or absolute count of validation batches per epoch.")
     parser.add_argument("--fast-dev-run", action="store_true")
 
     args = parser.parse_args()
 
-    if args.early_stopping_patience > 0 and args.validation_cases_dir is None:
-        raise SystemExit("--early-stopping-patience requires --validation-cases-dir so val/score can be monitored.")
+    configure_training_seed(args.seed)
+    pl.seed_everything(args.seed, workers=True)
+    if args.early_stopping_patience > 0 and args.validation_cases_dir is None and args.val_split == "none":
+        raise SystemExit("--early-stopping-patience requires --validation-cases-dir or --val-split so a score can be monitored.")
 
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision(args.matmul_precision)
@@ -462,9 +658,14 @@ def main() -> None:
         num_workers=num_workers,
         prefetch_factor=args.prefetch_factor,
         prefill_iterations=args.prefill_iterations,
+        seed=args.seed,
+        val_split=args.val_split,
+        val_fraction=args.val_fraction,
+        val_buffer_chunks=args.val_buffer_chunks,
     )
     datamodule.setup("fit")
     assert datamodule.dataset is not None
+    print_validation_overlap_warnings(args.validation_cases_dir, export_dirs)
 
     module = TerrainRepairLightningModule(
         num_material_classes=datamodule.dataset.num_material_classes,
@@ -476,6 +677,7 @@ def main() -> None:
         model_depth=args.model_depth,
         model_bottleneck_dilations=args.model_bottleneck_dilations,
         dropout=args.dropout,
+        weights=repair_loss_weights_from_args(args),
     )
     if args.resume is not None:
         load_repair_checkpoint(args.resume, module.model, map_location="cpu")
@@ -498,14 +700,20 @@ def main() -> None:
             k, v = pair.split("=", 1)
             metadata[k.strip()] = v.strip()
 
-    lit_logger = RepairLitLogger(
-        root_dir=str(lit_root),
-        name=args.litlogger_name,
-        teamspace=args.litlogger_teamspace,
-        metadata=metadata or None,
-        log_model=args.litlogger_log_model,
-        save_logs=not args.no_litlogger_save_logs,
-    )
+    logger: CSVLogger | RepairLitLogger | bool
+    if args.logger == "litlogger":
+        logger = RepairLitLogger(
+            root_dir=str(lit_root),
+            name=args.litlogger_name,
+            teamspace=args.litlogger_teamspace,
+            metadata=metadata or None,
+            log_model=args.litlogger_log_model,
+            save_logs=not args.no_litlogger_save_logs,
+        )
+    elif args.logger == "csv":
+        logger = CSVLogger(save_dir=str(lightning_root), name=args.litlogger_name or "repair")
+    else:
+        logger = False
 
     lightning_ckpt_dir = lightning_root / "checkpoints"
     lightning_checkpoint = ModelCheckpoint(
@@ -534,19 +742,31 @@ def main() -> None:
     if args.limit_train_batches is not None:
         raw = args.limit_train_batches
         limit_train_batches = float(raw) if "." in raw else int(raw)
+    limit_val_batches: float | int | None = None
+    if args.limit_val_batches is not None:
+        raw = args.limit_val_batches
+        limit_val_batches = float(raw) if "." in raw else int(raw)
 
     print(
         f"Training on {len(datamodule.dataset.export_dirs)} "
         f"world{'s' if len(datamodule.dataset.export_dirs) != 1 else ''}"
     )
+    if datamodule.val_dataset is not None:
+        print(
+            f"Spatial validation split: train_windows={len(datamodule.dataset)} "
+            f"val_windows={len(datamodule.val_dataset)} dropped_buffer_windows={datamodule.dropped_buffer_windows}"
+        )
+    elif args.val_split != "none":
+        print("Spatial validation split: disabled because no non-overlapping validation windows were available.")
     print(
         f"Lightning trainer: accelerator={args.accelerator} devices={args.devices} "
         f"strategy={args.strategy} precision={precision} windows={len(datamodule.dataset)} "
         f"num_workers={num_workers}"
     )
     print(
-        f"LitLogger: root={lit_root} name={args.litlogger_name!r} "
-        f"teamspace={args.litlogger_teamspace!r} log_model={args.litlogger_log_model}"
+        f"Logger: {args.logger} root={lit_root if args.logger == 'litlogger' else lightning_root} "
+        f"name={args.litlogger_name!r} teamspace={args.litlogger_teamspace!r} "
+        f"log_model={args.litlogger_log_model}"
     )
 
     callbacks: list[pl.Callback] = [
@@ -554,8 +774,9 @@ def main() -> None:
         validation_callback,
     ]
     if args.early_stopping_patience > 0:
+        early_stopping_monitor = "val/score" if args.validation_cases_dir is not None else "val_window/score"
         callbacks.append(EarlyStopping(
-            monitor="val/score",
+            monitor=early_stopping_monitor,
             mode="min",
             patience=args.early_stopping_patience,
             min_delta=args.early_stopping_min_delta,
@@ -563,8 +784,9 @@ def main() -> None:
     callbacks.extend([
         compatible_checkpoint,
         lightning_checkpoint,
-        LearningRateMonitor(logging_interval="step"),
     ])
+    if logger:
+        callbacks.append(LearningRateMonitor(logging_interval="step"))
 
     trainer = pl.Trainer(
         accelerator=args.accelerator,
@@ -573,7 +795,7 @@ def main() -> None:
         num_nodes=args.num_nodes,
         precision=precision,
         max_epochs=args.epochs,
-        logger=lit_logger,
+        logger=logger,
         callbacks=callbacks,
         accumulate_grad_batches=max(1, args.grad_accum_steps),
         gradient_clip_val=args.grad_clip_norm if args.grad_clip_norm > 0 else None,
@@ -582,6 +804,7 @@ def main() -> None:
         default_root_dir=str(lightning_root),
         fast_dev_run=args.fast_dev_run,
         limit_train_batches=limit_train_batches,
+        limit_val_batches=limit_val_batches,
     )
     trainer.fit(module, datamodule=datamodule, ckpt_path=args.ckpt_path)
 
@@ -594,4 +817,5 @@ __all__ = [
     "TerrainRepairDataModule",
     "TerrainRepairLightningModule",
     "main",
+    "split_spatial_window_indices",
 ]

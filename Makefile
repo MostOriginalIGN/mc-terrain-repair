@@ -33,6 +33,16 @@ DROPOUT ?= 0.0
 AUGMENT ?=
 EARLY_STOPPING_PATIENCE ?= 0
 EARLY_STOPPING_MIN_DELTA ?= 0.001
+LOSS_HEIGHT ?= 1.0
+LOSS_EDGE_HEIGHT ?= 0.35
+LOSS_GRADIENT ?= 0.75
+LOSS_SEAM ?= 0.75
+LOSS_LAPLACIAN ?= 0.2
+LOSS_HIGHPASS ?= 0.15
+LOSS_ROUGHNESS ?= 0.15
+LOSS_CONTEXT ?= 0.25
+LOSS_MATERIAL ?= 0.05
+LOSS_SUPPORT ?= 0.1
 MODEL_BASE_CHANNELS ?= 64
 MODEL_DEPTH ?= 4
 MODEL_BOTTLENECK_DILATIONS ?= 1,2,4,2
@@ -45,6 +55,10 @@ NUM_WORKERS ?= 0
 GRAD_CLIP_NORM ?= 1.0
 GRAD_ACCUM_STEPS ?= 1
 VALIDATE_EVERY ?= 1
+VAL_SPLIT ?= spatial
+VAL_FRACTION ?= 0.1
+VAL_BUFFER_CHUNKS ?= 8
+LIMIT_VAL_BATCHES ?=
 TENSORBOARD_DIR ?= ./runs/repair
 TENSORBOARD ?=
 COMPILE ?=
@@ -65,6 +79,7 @@ LITLOGGER_ROOT ?=
 LITLOGGER_METADATA ?=
 LITLOGGER_LOG_MODEL ?=
 LITLOGGER_NO_SAVE_LOGS ?=
+LOGGER ?= csv
 INFER_TILE_SIZE ?= 128
 ORIGIN_CHUNK_X ?=
 ORIGIN_CHUNK_Z ?=
@@ -88,7 +103,7 @@ help:
 	@printf "  make train [OUT=...] [EPOCHS=...] [BATCH_SIZE=...] [LIGHTNING_DEVICES=1] [AMP=auto|off|fp16|bf16]\n"
 	@printf "            PyTorch Lightning + LitLogger; optional: [LR_SCHEDULER=cosine] [DROPOUT=0.1] [AUGMENT=1]\n"
 	@printf "            [WEIGHT_DECAY=1e-2] [EARLY_STOPPING_PATIENCE=25] [SAVE_EVERY=5] [VALIDATE_EVERY=5]\n"
-	@printf "            [LITLOGGER_NAME=...] [LITLOGGER_TEAMSPACE=user/ts] [LITLOGGER_ROOT=path]\n"
+	@printf "            [LOGGER=csv|litlogger|none] [LITLOGGER_NAME=...] [LITLOGGER_TEAMSPACE=user/ts] [LITLOGGER_ROOT=path]\n"
 	@printf "            [LITLOGGER_METADATA='k=v'] [LITLOGGER_LOG_MODEL=1]\n"
 	@printf "  make train-legacy …                            Plain PyTorch loop + optional TensorBoard\n"
 	@printf "  make export-onnx [REPAIR_CHECKPOINT=...]       Export repair.pt to ONNX (+ JSON metadata for plugins)\n"
@@ -133,9 +148,20 @@ train:
 		--batch-size $(BATCH_SIZE) \
 		--grad-accum-steps $(GRAD_ACCUM_STEPS) \
 		--learning-rate $(LEARNING_RATE) \
+		--seed $(SEED) \
 		--lr-scheduler "$(LR_SCHEDULER)" \
 		--weight-decay $(WEIGHT_DECAY) \
 		--dropout $(DROPOUT) \
+		--loss-height $(LOSS_HEIGHT) \
+		--loss-edge-height $(LOSS_EDGE_HEIGHT) \
+		--loss-gradient $(LOSS_GRADIENT) \
+		--loss-seam $(LOSS_SEAM) \
+		--loss-laplacian $(LOSS_LAPLACIAN) \
+		--loss-highpass $(LOSS_HIGHPASS) \
+		--loss-roughness $(LOSS_ROUGHNESS) \
+		--loss-context $(LOSS_CONTEXT) \
+		--loss-material $(LOSS_MATERIAL) \
+		--loss-support $(LOSS_SUPPORT) \
 		$(if $(AUGMENT),--augment,) \
 		$(if $(filter-out 0,$(EARLY_STOPPING_PATIENCE)),--early-stopping-patience $(EARLY_STOPPING_PATIENCE) --early-stopping-min-delta $(EARLY_STOPPING_MIN_DELTA),) \
 		--model-base-channels $(MODEL_BASE_CHANNELS) \
@@ -154,8 +180,13 @@ train:
 		--grad-clip-norm $(GRAD_CLIP_NORM) \
 		--validation-cases-dir "$(REPAIR_CASES)" \
 		--validate-every $(VALIDATE_EVERY) \
+		--val-split "$(VAL_SPLIT)" \
+		--val-fraction $(VAL_FRACTION) \
+		--val-buffer-chunks $(VAL_BUFFER_CHUNKS) \
 		--tf32 "$(TF32)" \
 		--lightning-root-dir "$(LIGHTNING_ROOT)" \
+		--logger "$(LOGGER)" \
+		$(if $(LIMIT_VAL_BATCHES),--limit-val-batches $(LIMIT_VAL_BATCHES),) \
 		$(if $(LIGHTNING_PRECISION),--precision "$(LIGHTNING_PRECISION)",) \
 		$(if $(LITLOGGER_NAME),--litlogger-name "$(LITLOGGER_NAME)",) \
 		$(if $(LITLOGGER_TEAMSPACE),--litlogger-teamspace "$(LITLOGGER_TEAMSPACE)",) \
@@ -178,7 +209,7 @@ export-onnx:
 		--opset $(ONNX_OPSET)
 
 train-legacy:
-	uv run --package mc-terrain-unet python -m unet.repair_training --export-dir "$(OUT)" --checkpoint "$(REPAIR_CHECKPOINT)" --latest-checkpoint "$(REPAIR_LATEST_CHECKPOINT)" --best-checkpoint "$(REPAIR_BEST_CHECKPOINT)" --epochs $(EPOCHS) --save-every $(SAVE_EVERY) --batch-size $(BATCH_SIZE) --grad-accum-steps $(GRAD_ACCUM_STEPS) --learning-rate $(LEARNING_RATE) --model-base-channels $(MODEL_BASE_CHANNELS) --model-depth $(MODEL_DEPTH) --model-bottleneck-dilations "$(MODEL_BOTTLENECK_DILATIONS)" --tile-size $(TRAIN_TILE_SIZE) --stride-chunks $(STRIDE_CHUNKS) --mask-mode "$(REPAIR_MASK_MODE)" --device "$(DEVICE)" --amp "$(AMP)" --num-workers $(NUM_WORKERS) --grad-clip-norm $(GRAD_CLIP_NORM) --validation-cases-dir "$(REPAIR_CASES)" --validate-every $(VALIDATE_EVERY) --tf32 "$(TF32)" $(if $(TENSORBOARD),--tensorboard-dir "$(TENSORBOARD_DIR)",) $(if $(COMPILE),--compile,) $(if $(CHANNELS_LAST),--channels-last,) $(if $(RESUME),--resume "$(RESUME)",)
+	uv run --package mc-terrain-unet python -m unet.repair_training --export-dir "$(OUT)" --checkpoint "$(REPAIR_CHECKPOINT)" --latest-checkpoint "$(REPAIR_LATEST_CHECKPOINT)" --best-checkpoint "$(REPAIR_BEST_CHECKPOINT)" --epochs $(EPOCHS) --save-every $(SAVE_EVERY) --batch-size $(BATCH_SIZE) --grad-accum-steps $(GRAD_ACCUM_STEPS) --learning-rate $(LEARNING_RATE) --seed $(SEED) --model-base-channels $(MODEL_BASE_CHANNELS) --model-depth $(MODEL_DEPTH) --model-bottleneck-dilations "$(MODEL_BOTTLENECK_DILATIONS)" --tile-size $(TRAIN_TILE_SIZE) --stride-chunks $(STRIDE_CHUNKS) --mask-mode "$(REPAIR_MASK_MODE)" --device "$(DEVICE)" --amp "$(AMP)" --num-workers $(NUM_WORKERS) --grad-clip-norm $(GRAD_CLIP_NORM) --validation-cases-dir "$(REPAIR_CASES)" --validate-every $(VALIDATE_EVERY) --tf32 "$(TF32)" --loss-height $(LOSS_HEIGHT) --loss-edge-height $(LOSS_EDGE_HEIGHT) --loss-gradient $(LOSS_GRADIENT) --loss-seam $(LOSS_SEAM) --loss-laplacian $(LOSS_LAPLACIAN) --loss-highpass $(LOSS_HIGHPASS) --loss-roughness $(LOSS_ROUGHNESS) --loss-context $(LOSS_CONTEXT) --loss-material $(LOSS_MATERIAL) --loss-support $(LOSS_SUPPORT) $(if $(TENSORBOARD),--tensorboard-dir "$(TENSORBOARD_DIR)",) $(if $(COMPILE),--compile,) $(if $(CHANNELS_LAST),--channels-last,) $(if $(RESUME),--resume "$(RESUME)",)
 
 prepare-infer:
 	uv run --package mc-terrain-unet python scripts/prepare_infer_inputs.py --export-dir "$(OUT)" --out-dir "$(INPUTS)" --checkpoint "$(REPAIR_CHECKPOINT)" --tile-size $(INFER_TILE_SIZE) $(if $(ORIGIN_CHUNK_X),--origin-chunk-x $(ORIGIN_CHUNK_X),) $(if $(ORIGIN_CHUNK_Z),--origin-chunk-z $(ORIGIN_CHUNK_Z),) --mask-top $(MASK_TOP) --mask-left $(MASK_LEFT) --mask-height $(MASK_HEIGHT) --mask-width $(MASK_WIDTH)

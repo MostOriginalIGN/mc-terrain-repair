@@ -223,6 +223,7 @@ class TerrainRepairDataset(TerrainDiffusionDataset):
             "boundary_distance": sample.boundary_distance,
             "prefill_gradients": sample.prefill_gradients,
             "prefill_laplacian": sample.prefill_laplacian,
+            "height_scale": torch.tensor(float(self.height_max - self.height_min), dtype=torch.float32),
             "origin_chunk_x": torch.tensor(sample.origin_chunk_x),
             "origin_chunk_z": torch.tensor(sample.origin_chunk_z),
         }

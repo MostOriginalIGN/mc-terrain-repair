@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
 
@@ -11,17 +12,21 @@ from unet.infer_inputs import prepare_inference_inputs
 from unet.repair_data import TerrainRepairDataset
 from unet.repair_inference import run_repair_job, run_saved_case_jobs
 from unet.repair_inference import main as repair_inference_main
-from unet.repair_lightning import TerrainRepairDataModule, TerrainRepairLightningModule
+from unet.repair_lightning import TerrainRepairDataModule, TerrainRepairLightningModule, split_spatial_window_indices
 from unet.repair_model import TerrainRepairUNet
 from unet.repair_training import (
     RepairTrainingState,
     build_repair_checkpoint_meta,
     compute_repair_losses,
+    context_style_loss,
     evaluate_repair_cases,
+    height_highpass,
+    height_laplacian,
     load_repair_checkpoint,
     resolve_training_export_dirs,
     save_repair_checkpoint,
     train_repair_step,
+    validation_overlap_warnings,
 )
 from exporter.vocab import UNKNOWN_INDEX
 
@@ -69,6 +74,8 @@ def test_repair_dataset_features_and_unknown_material(tmp_path) -> None:
     assert sample["boundary_distance"].shape == (1, 128, 128)
     assert sample["prefill_gradients"].shape == (2, 128, 128)
     assert sample["prefill_laplacian"].shape == (1, 128, 128)
+    assert sample["height_scale"].shape == ()
+    assert sample["height_scale"].item() > 0
     assert torch.isfinite(sample["prefill_height"]).all()
     assert torch.allclose(sample["prefill_height"] * (1.0 - sample["mask"]), sample["target_height"] * (1.0 - sample["mask"]))
     assert sample["known_material"][sample["mask"].squeeze(0).bool()].eq(UNKNOWN_INDEX).all()
@@ -171,6 +178,40 @@ def test_resolve_training_export_dirs_from_parent_directory(tmp_path) -> None:
     assert resolved == [export_a.resolve(), export_b.resolve()]
 
 
+def test_validation_overlap_warning_detects_shared_export_dir(tmp_path) -> None:
+    export_dir = tmp_path / "export"
+    cases_dir = tmp_path / "cases"
+    case_dir = cases_dir / "case_a"
+    export_dir.mkdir()
+    case_dir.mkdir(parents=True)
+    (case_dir / "metadata.json").write_text(
+        json.dumps({"export_dir": str(export_dir), "origin_chunk_x": 0, "origin_chunk_z": 0}),
+        encoding="utf-8",
+    )
+
+    warnings = validation_overlap_warnings(cases_dir, [export_dir])
+
+    assert len(warnings) == 1
+    assert "case_a" in warnings[0]
+
+
+def test_spatial_split_holds_out_non_overlapping_windows(tmp_path) -> None:
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    _write_fake_export(export_dir, width_chunks=24, height_chunks=12)
+    dataset = TerrainRepairDataset(export_dir, tile_size=128, stride_chunks=1, mask_mode="rectangle", cache_arrays=False)
+
+    train_indices, val_indices = split_spatial_window_indices(dataset, val_fraction=0.25, buffer_chunks=4)
+
+    assert train_indices
+    assert val_indices
+    train_origins = [dataset.window_origins[index] for index in train_indices]
+    val_origins = [dataset.window_origins[index] for index in val_indices]
+    min_val_x = min(origin[0] for origin in val_origins)
+    max_train_x = max(origin[0] for origin in train_origins)
+    assert max_train_x + dataset.chunks_per_side - 1 + 4 < min_val_x
+
+
 def test_repair_model_training_and_checkpoint_roundtrip(tmp_path) -> None:
     export_dir = tmp_path / "export"
     export_dir.mkdir()
@@ -198,6 +239,14 @@ def test_repair_model_training_and_checkpoint_roundtrip(tmp_path) -> None:
     losses = compute_repair_losses(model, batch)
     assert torch.isfinite(losses.total_loss)
     assert losses.total_loss.item() > 0
+    assert torch.isfinite(losses.laplacian_loss)
+    assert torch.isfinite(losses.highpass_loss)
+    assert torch.isfinite(losses.roughness_loss)
+    assert torch.isfinite(losses.context_loss)
+    assert torch.isfinite(losses.height_mae_blocks)
+    assert 0.0 <= losses.height_within_1_block.item() <= 1.0
+    assert 0.0 <= losses.height_within_2_blocks.item() <= 1.0
+    assert torch.isfinite(losses.gradient_mae_blocks)
 
     first_param = next(model.parameters()).detach().clone()
     train_repair_step(model, optimizer, batch)
@@ -227,6 +276,8 @@ def test_repair_model_training_and_checkpoint_roundtrip(tmp_path) -> None:
     assert payload["meta"]["epoch"] == 2
     assert payload["meta"]["global_step"] == 12
     assert payload["meta"]["export_dirs"] == [str(export_dir.resolve())]
+    assert payload["meta"]["validation_score_type"] == "visual_score"
+    assert payload["meta"]["loss_weights"]["material"] < 0.2
 
     bad_checkpoint = tmp_path / "bad_repair.pt"
     bad_checkpoint.write_bytes(b"not a torch checkpoint")
@@ -267,6 +318,32 @@ def test_repair_model_dropout_train_vs_eval(tmp_path) -> None:
         prefill_laplacian=batch["prefill_laplacian"],
     )
     assert not torch.allclose(train_out.height_residual, eval_out.height_residual)
+
+
+def test_height_detail_operators_detect_oversmoothing() -> None:
+    yy, xx = torch.meshgrid(torch.arange(32), torch.arange(32), indexing="ij")
+    target = (((xx // 4 + yy // 4) % 2).float() * 0.2 + yy.float() / 64.0).view(1, 1, 32, 32)
+    smooth = torch.nn.functional.avg_pool2d(target, kernel_size=7, stride=1, padding=3, count_include_pad=False)
+
+    lap_error = (height_laplacian(smooth) - height_laplacian(target)).abs().mean()
+    highpass_error = (height_highpass(smooth) - height_highpass(target)).abs().mean()
+
+    assert lap_error.item() > 0.01
+    assert highpass_error.item() > 0.01
+
+
+def test_context_style_loss_detects_mismatched_local_terrain() -> None:
+    yy, xx = torch.meshgrid(torch.arange(64), torch.arange(64), indexing="ij")
+    target = (((xx // 3 + yy // 3) % 2).float() * 0.16 + yy.float() / 96.0).view(1, 1, 64, 64)
+    mask = torch.zeros_like(target)
+    mask[:, :, 20:44, 20:44] = 1.0
+    smooth_inside = torch.nn.functional.avg_pool2d(target, kernel_size=11, stride=1, padding=5, count_include_pad=False)
+    composite = target * (1.0 - mask) + smooth_inside * mask
+
+    matched_loss = context_style_loss(target, target, mask)
+    smoothed_loss = context_style_loss(composite, target, mask)
+
+    assert smoothed_loss.item() > matched_loss.item() + 0.01
 
 
 def test_lightning_module_training_step(tmp_path) -> None:
@@ -318,7 +395,6 @@ def test_repair_onnx_export_roundtrip(tmp_path) -> None:
     export_dir.mkdir()
     _write_fake_export(export_dir, width_chunks=8, height_chunks=8)
     dataset = TerrainRepairDataset(export_dir, tile_size=128, mask_mode="rectangle", seed=1)
-    batch = _batch_from_sample(dataset[0])
 
     model = TerrainRepairUNet(num_material_classes=dataset.num_material_classes, dropout=0.0)
     checkpoint = tmp_path / "repair.pt"
@@ -439,6 +515,24 @@ def test_repair_inference_outputs_and_preserves_known_pixels(tmp_path, monkeypat
     assert metrics is not None
     assert metrics.case_count == 1
     assert np.isfinite(metrics.score)
+    assert metrics.score == pytest.approx(metrics.visual_score)
+    assert np.isfinite(metrics.legacy_score)
+    assert np.isfinite(metrics.gradient_mae)
+    assert np.isfinite(metrics.height_mae_blocks)
+    assert np.isfinite(metrics.seam_mae_blocks)
+    assert np.isfinite(metrics.gradient_mae_blocks)
+    assert np.isfinite(metrics.laplacian_mae_blocks)
+    assert np.isfinite(metrics.highpass_mae_blocks)
+    assert np.isfinite(metrics.laplacian_mae)
+    assert np.isfinite(metrics.highpass_mae)
+    assert np.isfinite(metrics.roughness_ratio)
+    assert np.isfinite(metrics.context_style_error_blocks)
+    assert np.isfinite(metrics.context_roughness_ratio)
+    assert np.isfinite(metrics.context_laplacian_ratio)
+    assert np.isfinite(metrics.context_highpass_ratio)
+    assert 0.0 <= metrics.height_within_1_block <= 1.0
+    assert 0.0 <= metrics.height_within_2_blocks <= 1.0
+    assert metrics.mask_pixel_count == int(mask.sum())
     assert 0.0 <= metrics.material_accuracy <= 1.0
 
     argv = [
